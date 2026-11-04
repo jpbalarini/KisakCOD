@@ -232,11 +232,24 @@ void __cdecl FX_SaveEffectDefTable_LoadObj(MemoryFile* memFile)
     FX_ForEachEffectDef((void(__cdecl*)(const FxEffectDef*, void*))FX_SaveEffectDefTableEntry_FileLoadObj, memFile);
 }
 
+#ifdef KISAK_WEB
+// DB_EnumXAssets passes XAssetHeader (a union) by value. In the wasm C ABI a union is passed by reference, so calling
+// FX_SaveEffectDefTableEntry_FileLoadObj(const FxEffectDef*, ...) through that signature handed it a pointer to the union.
+static void __cdecl FX_SaveEffectDefTableEntry_FastFile(XAssetHeader header, void *memFile)
+{
+    FX_SaveEffectDefTableEntry_FileLoadObj(header.fx, (MemoryFile *)memFile);
+}
+#endif
+
 void __cdecl FX_SaveEffectDefTable_FastFile(MemoryFile *memFile)
 {
     DB_EnumXAssets(
         ASSET_TYPE_FX,
+#ifdef KISAK_WEB
+        FX_SaveEffectDefTableEntry_FastFile,
+#else
         (void(__cdecl *)(XAssetHeader, void *))FX_SaveEffectDefTableEntry_FileLoadObj,
+#endif
         memFile,
         0);
 }

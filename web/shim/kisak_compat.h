@@ -36,8 +36,24 @@ _Static_assert(sizeof(long) == 4, "DWORD/LONG assumptions");
 #define stricmp strcasecmp
 #define strnicmp strncasecmp
 #define _strdup strdup
-#define _snprintf snprintf
-#define _vsnprintf vsnprintf
+// MSVC's legacy _snprintf/_vsnprintf return -1 (or the buffer size, with no terminator) when the output does not fit, never the would-be
+// length that C99 vsnprintf returns. The engine's va()/Com_sprintf* are written against that (e.g. `if (len >= 1024) Com_Error("va: too
+// short")` never fires on MSVC, which silently truncates), so emulate it. Plain `snprintf` stays C99, as in the MSVC 2015+ CRT.
+static inline int kisak_vsnprintf_legacy(char* d, size_t n, const char* fmt, va_list a)
+{
+    int r = vsnprintf(d, n, fmt, a);
+    if (r < 0) return -1;
+    return ((size_t)r <= n) ? r : -1;
+}
+static inline int kisak_snprintf_legacy(char* d, size_t n, const char* fmt, ...)
+{
+    va_list a; va_start(a, fmt);
+    int r = kisak_vsnprintf_legacy(d, n, fmt, a);
+    va_end(a);
+    return r;
+}
+#define _snprintf kisak_snprintf_legacy
+#define _vsnprintf kisak_vsnprintf_legacy
 #define _isnan(x) isnan(x)
 #define _finite(x) isfinite(x)
 #define _unlink unlink
@@ -99,7 +115,7 @@ template <size_t N> static inline int sprintf_s(char (&d)[N], const char* fmt, .
 static inline int sprintf_s(char* d, size_t n, const char* fmt, ...) { va_list a; va_start(a, fmt); int r = vsnprintf(d, n, fmt, a); va_end(a); return r; }
 #define sscanf_s sscanf
 typedef FILE _iobuf;
-static inline int _vsnprintf_s(char* d, size_t n, size_t count, const char* fmt, va_list a) { (void)count; return vsnprintf(d, n, fmt, a); }
+static inline int _vsnprintf_s(char* d, size_t n, size_t count, const char* fmt, va_list a) { (void)count; int r = vsnprintf(d, n, fmt, a); return (r < 0 || (size_t)r >= n) ? -1 : r; }
 #define PF_NON_TEMPORAL_LEVEL_ALL 0
 #define PreFetchCacheLine(level, addr) ((void)(level), (void)(addr))
 

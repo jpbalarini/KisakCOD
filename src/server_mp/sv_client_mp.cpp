@@ -372,9 +372,13 @@ void __cdecl SV_SetClientStat(int clientNum, int index, uint32_t value)
     {
         if (index < 3498)
         {
-            if (*(uint32_t *)&svs.clients[clientNum].voicePackets[17].data[4 * index + 75] == value) // KISAKTODO
+            // Stats >= 2000 are 32-bit values stored right after the 2000 byte-sized ones (stats[4 .. 2003]), i.e. at stats[2004 + 4 * (index - 2000)].
+            // The decompiled code addressed this as voicePackets[17].data[4 * index + 75], which only matches the retail client_t layout
+            // (VoicePacket_t packed to 0x105 bytes); with natural alignment (0x108) it points 69 bytes before the real slot.
+            uint32_t *slot = (uint32_t *)&v4->stats[4 * index - 5996];
+            if (*slot == value)
                 return;
-            *(uint32_t *)&svs.clients[clientNum].voicePackets[17].data[4 * index + 75] = value;
+            *slot = value;
             goto LABEL_16;
         }
         if (!alwaysfails)
@@ -417,7 +421,7 @@ int __cdecl SV_GetClientStat(int clientNum, int index)
     if (index < 2000)
         return svs.clients[clientNum].stats[index + 4];
     if (index < 3498)
-        return *(uint32_t *)&svs.clients[clientNum].voicePackets[17].data[4 * index + 75]; // KISAKTODO
+        return *(uint32_t *)&svs.clients[clientNum].stats[4 * index - 5996]; // see SV_SetClientStat
     if (!alwaysfails)
     {
         v3 = va("Unhandled stat index %i", index);

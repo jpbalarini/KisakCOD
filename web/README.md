@@ -94,3 +94,25 @@ and serves the install dir read-only under `/data/` (never copied or uploaded).
 - `build.py` has no header dependency scanning for engine files (use `--force` after touching `shim/*.h`); web-only sources are rebuilt
   automatically when any header under `web/` changes.
 - WebGL needs all framebuffer attachments the same size; D3D9 allows a larger depth buffer (substitute depth renderbuffers).
+
+## Platform-assumption audit (MSVC/x86 → clang/wasm32)
+After the `rand()` bug, the whole engine was audited for other places where decompiled MSVC-era code silently assumes its original platform.
+What was checked, and what came out of it:
+
+| Check | Result |
+|---|---|
+| **Compiler semantics.** The code type-puns through casts, relies on wrapping signed arithmetic and dereferences before null-checking; MSVC never exploited that, clang does. | `build.py` now passes `-fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks`. |
+| **`long double`** is 64-bit on MSVC but a 128-bit software-float type on wasm (220 uses, mostly IDA `fp2`/`st7` temporaries; also changed struct sizes, e.g. `source_s`). | `-Xclang -mlong-double-64`; guarded in `platform/layout_guard.cpp`. `std::format` in a dev-only asset-dump command still produces three harmless `to_chars` link-signature warnings. |
+| **`_snprintf`/`_vsnprintf`** return -1 on truncation on MSVC, the would-be length with C99. `va()` has `if (len >= 1024) Com_Error("va: too short")`, which never fires on MSVC (it truncates silently) but would have become a fatal error for any >1023 char string. | Legacy semantics emulated in `kisak_compat.h` (`snprintf` itself stays C99, as in MSVC 2015+). |
+| **Struct layouts.** The headers carry the retail 32-bit size of ~1000 structs (`// sizeof=0x...`). | `python3 web/tools/layout_check.py` compiles a `static_assert` per struct: 15 differences, all explained (SP/MP duplicates, empty structs, ODE internals, unpacked `VoicePacket_t`, intentionally enlarged loopback buffers). The check is the audit's regression test. |
+| **Hard-coded byte offsets** in decompiled code (`*(_DWORD*)&buf[8*n - 9596]`, `scale[i - 3]`, `serverHardwareIconList[40*n - 5119]`). | `SV_GetCachedSnapshotInternal` and `Outdoor_*` rewritten to use the real members; the UI map-list offsets are verified at compile time (`layout_guard.cpp`). |
+| **Union-by-value callbacks** (`XAssetHeader`) reached through function-pointer casts. | Only two were wrong: `Image_Free` (M2) and `FX_SaveEffectDefTableEntry_FileLoadObj` (`fx_archive.cpp`, the effect-table save path). The technique-set handler takes the union by value too, so it is correct. |
+| **Uninitialised variables** (`clang -Wuninitialized -Wsometimes-uninitialized -Wconditional-uninitialized` over all 444 TUs). | 32 warnings: all decompiler artifacts (loop counters returned as `result`, flags correlated with an assignment) except one `strlen()` of an unfilled CD-key buffer in `ui_main_mp.cpp` (initialised). |
+
+Real upstream bug found on the way: `SV_SetClientStat`/`SV_GetClientStat` addressed the 32-bit stats (index ≥ 2000) as `voicePackets[17].data[4*index+75]`,
+which only lands in `client_t::stats` for the retail packed `VoicePacket_t`; with the header's natural alignment it pointed 69 bytes before the slot and
+overlapped the byte stats. They now index `stats[4*index - 5996]` directly (matters for the multiplayer server, M4).
+
+Still open, deliberately: the `ui_main_mp.cpp` server-browser code has ~60 more raw-offset accesses into `sharedUiInfo`/`info.text` (only the map-list ones are
+verified), `qsort` (~30 uses) is not stable and orders ties differently from MSVC's (the iwd-name sort has a total order; the runtime ones — player use list, scoreboard rank, touch-image list, server list — only see a different but valid order on ties; the material/BSP/anim sorts are in `*_load_obj` raw-asset paths that fastfile loading does not take), and `float→int` casts of out-of-range values saturate on wasm
+instead of producing 0x80000000.

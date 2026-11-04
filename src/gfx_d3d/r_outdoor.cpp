@@ -21,21 +21,21 @@ void __cdecl Outdoor_ApplyBoundingBox(const float *outdoorMin, const float *outd
         {
             //iassert( outdoorGlob.bbox[SUPREMUM][dimIter] == MIN_WORLD_COORD );
             outdoorGlob.bbox[0][dimIter] = 0.0;
-            outdoorGlob.scale[dimIter - 3] = 0.0;
+            outdoorGlob.bbox[1][dimIter] = 0.0;
         }
-        if (outdoorGlob.bbox[0][dimIter] > outdoorGlob.scale[dimIter - 3])
+        if (outdoorGlob.bbox[0][dimIter] > outdoorGlob.bbox[1][dimIter])
             MyAssertHandler(
                 ".\\r_outdoor.cpp",
                 94,
                 1,
                 "%s",
                 "outdoorGlob.bbox[SUPREMUM][dimIter] >= outdoorGlob.bbox[INFIMUM][dimIter]");
-        if (outdoorGlob.scale[dimIter - 3] - outdoorGlob.bbox[0][dimIter] < 1.0)
+        if (outdoorGlob.bbox[1][dimIter] - outdoorGlob.bbox[0][dimIter] < 1.0)
         {
             outdoorGlob.bbox[0][dimIter] = outdoorGlob.bbox[0][dimIter] - 0.5;
-            outdoorGlob.scale[dimIter - 3] = outdoorGlob.scale[dimIter - 3] + 0.5;
+            outdoorGlob.bbox[1][dimIter] = outdoorGlob.bbox[1][dimIter] + 0.5;
         }
-        if (outdoorGlob.bbox[0][dimIter] >= outdoorGlob.scale[dimIter - 3])
+        if (outdoorGlob.bbox[0][dimIter] >= outdoorGlob.bbox[1][dimIter])
             MyAssertHandler(
                 ".\\r_outdoor.cpp",
                 100,
@@ -53,7 +53,7 @@ int Outdoor_UpdateTransforms()
     for (dimension = 0; dimension != 3; ++dimension)
     {
         outdoorGlob.scale[dimension] = (outdoorMapSize[dimension] - 1)
-            / (outdoorGlob.scale[dimension - 3] - outdoorGlob.bbox[0][dimension]);
+            / (outdoorGlob.bbox[1][dimension] - outdoorGlob.bbox[0][dimension]);
         outdoorGlob.invScale[dimension] = 1.0 / outdoorGlob.scale[dimension];
         outdoorGlob.add[dimension] = -outdoorGlob.bbox[0][dimension] * outdoorGlob.scale[dimension];
         result = dimension + 1;
@@ -79,7 +79,7 @@ void __cdecl Outdoor_SetRendererOutdoorLookupMatrix(GfxWorld *world)
 
     for (dimIter = 0; dimIter != 3; ++dimIter)
     {
-        outdoorScale[dimIter] = 1.0 / (outdoorGlob.scale[dimIter - 3] - outdoorGlob.bbox[0][dimIter]);
+        outdoorScale[dimIter] = 1.0 / (outdoorGlob.bbox[1][dimIter] - outdoorGlob.bbox[0][dimIter]);
         outdoorTranslate[dimIter] = -outdoorGlob.bbox[0][dimIter] * outdoorScale[dimIter];
     }
     MatrixIdentity44(world->outdoorLookupMatrix);
