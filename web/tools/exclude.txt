@@ -1,0 +1,15 @@
+# Source files NOT compiled into the web build. Each is a Windows-only subsystem that is replaced for the
+# browser (window/input/net/voice) or needs a portable rewrite (MMX skinning). Format: path  # reason
+src/win32/win_input.cpp          # DirectInput -> browser input events (web/platform)
+src/win32/win_wndproc.cpp        # Win32 window procedure -> canvas/DOM events
+src/win32/win_syscon.cpp         # Win32 system console window
+src/win32/win_net.cpp            # Winsock UDP -> WebSocket transport (M4)
+src/win32/win_voice.cpp          # DirectSound voice capture
+src/groupvoice/record_dsound.cpp # DirectSound voice
+src/groupvoice/play_dsound.cpp   # DirectSound voice
+src/groupvoice/encode.cpp        # speex voice chat (not needed for the web port)
+src/groupvoice/decode.cpp        # speex voice chat
+src/gfx_d3d/r_texturemem.cpp     # DirectDraw video-memory query
+src/gfx_d3d/r_screenshot.cpp     # GDI+ screenshots
+src/gfx_d3d/r_model_skin_sse.cpp # MMX skinning kernels -> needs a portable/wasm-simd rewrite
+src/win32/win_main.cpp           # WinMain/window/console/splash -> web/platform/sys_web.cpp provides the Sys_* subset
