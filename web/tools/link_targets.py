@@ -11,6 +11,7 @@ def link_m1(target, objs, root, web, build):
         '--pre-js', os.path.join(web, 'm1', 'prejs.js'), '-sPROXY_TO_PTHREAD', '-sOFFSCREENCANVAS_SUPPORT', '-sOFFSCREEN_FRAMEBUFFER', '-sMIN_WEBGL_VERSION=2', '-sMAX_WEBGL_VERSION=2']
     p = subprocess.run(cmd, capture_output=True, text=True)
     open(os.path.join(out_dir, 'link.log'), 'w').write(p.stdout + p.stderr)
+    import shutil; shutil.copy(os.path.join(web, 'm1', 'audio-worklet.js'), out_dir)
     jsf = os.path.join(out_dir, 'index.js')
     if os.path.exists(jsf):
         js = open(jsf).read().replace('captured an uncaught exception: ${ex}`', 'captured an uncaught exception: ${ex}\\n${ex && ex.stack}`')

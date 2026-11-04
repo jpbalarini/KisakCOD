@@ -10,6 +10,8 @@
 #include <GLES3/gl3.h>
 
 #include <atomic>
+#include <new>
+#include <stdlib.h>
 #include <map>
 #include <mutex>
 #include <string>
@@ -21,6 +23,25 @@
 namespace d3dgl {
 
 void Log(const char *fmt, ...);
+
+// The engine requires the memory it gets from Lock() to be 16-byte aligned (e.g. R_LockSkinnedCache rejects the lock - and so
+// disables model skinning for that frame - when (ptr & 15) != 0), but std::vector only guarantees malloc alignment (8 in wasm).
+template <class T, size_t Align>
+struct AlignedAlloc {
+    using value_type = T;
+    AlignedAlloc() = default;
+    template <class U> AlignedAlloc(const AlignedAlloc<U, Align> &) {}
+    template <class U> struct rebind { using other = AlignedAlloc<U, Align>; };
+    T *allocate(size_t n) {
+        void *p = nullptr;
+        if (posix_memalign(&p, Align, n ? n * sizeof(T) : 1) != 0) throw std::bad_alloc();
+        return (T *)p;
+    }
+    void deallocate(T *p, size_t) { free(p); }
+    template <class U> bool operator==(const AlignedAlloc<U, Align> &) const { return true; }
+    template <class U> bool operator!=(const AlignedAlloc<U, Align> &) const { return false; }
+};
+using Bytes = std::vector<uint8_t, AlignedAlloc<uint8_t, 64>>;
 
 // ---- GL extension tokens that gl3.h does not carry
 enum : GLenum {
@@ -83,7 +104,7 @@ struct TexCore {
     GLuint tex = 0;         // created lazily on the GL thread
     bool glFailed = false;
     DWORD lod = 0;
-    struct Level { std::vector<uint8_t> data; bool dirty = false; };
+    struct Level { Bytes data; bool dirty = false; };
     std::vector<Level> lv;  // faces * levels, index = face * levels + level
     std::mutex lock;
 
@@ -174,7 +195,7 @@ struct Surface : RefImpl<IDirect3DSurface9> {
     UINT level = 0;
     GLuint rbo = 0;              // K_RENDERBUFFER
     bool isBackbuffer = false;
-    std::vector<uint8_t> cpu;    // K_PLAIN
+    Bytes cpu;                   // K_PLAIN
     Surface(Device *d);
     ~Surface() override;
     bool isDepth() const;
@@ -191,7 +212,7 @@ struct Surface : RefImpl<IDirect3DSurface9> {
 
 // ---------------------------------------------------------------- buffers
 struct BufferCore {
-    std::vector<uint8_t> cpu;
+    Bytes cpu;
     GLuint buf = 0;
     GLenum target = GL_ARRAY_BUFFER;
     size_t dirtyLo = (size_t)-1, dirtyHi = 0;

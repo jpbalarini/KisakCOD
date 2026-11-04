@@ -16,9 +16,14 @@ the engine sources under `src/` carry only small patches (see `git diff`).
 - **M2 (done):** playable offline. `?args=%2Bdevmap%20mp_crash` loads the real `mp_crash` map, runs the real GSC scripts, shows the
   loading screen, the team/class menus and drops you into first person (M16A4 viewmodel, HUD, minimap); keyboard + mouse work
   (`platform/input_web.cpp`), ~45 fps in game, 0 GL errors. A "Player" profile is pre-seeded so you skip the profile screen.
-- **Next:** M3 audio (Web Audio backend for the OpenAL/EFX layer), M4 WebSocket multiplayer. Known rough edges: menu frames are slow
-  (~12 fps, blur passes), the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour fallback,
-  occlusion queries report 0, Bink/Steam are stubs, profile/config files are memory-only (lost on reload), no gamepad.
+- **M3 (done):** sound. `audio/al_web.cpp` implements the OpenAL subset the engine's sound driver uses (buffers, static + queued/streaming
+  sources, looping, pitch, gain, L/R pan from the source position, soft limiter) as a mixer on its own pthread, writing 48 kHz stereo
+  into a ring buffer in shared wasm memory; `m1/audio-worklet.js` (an AudioWorklet) plays it. Emscripten's own OpenAL can't be used:
+  it needs an `AudioContext`, which doesn't exist in the engine's worker. The page creates the context suspended and resumes it on
+  the first click/key (an on-page hint shows until then). `kisakAudio.peak()` / `.maxPeak` in the JS console show the output level.
+- **Next:** M4 WebSocket multiplayer. Known rough edges: no reverb/EQ (EFX is stubbed), no HRTF/3D beyond left-right pan, menu frames
+  are slow (~12 fps, blur passes), the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour
+  fallback, occlusion queries report 0, Bink/Steam are stubs, profile/config files are memory-only (lost on reload), no gamepad.
 
 ## Build & run (needs emscripten, python3, node)
 ```bash
@@ -37,7 +42,7 @@ web/run_m1.sh                               # serves it + your game data on http
 ```
 Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser swallows Esc while the pointer is locked, so the
 loss of pointer lock is turned back into an Esc press). `--no-profile` shows the profile screen instead of seeding one.
-URL options: `?args=--gldebug` (check GL errors after every draw), `?args=--trace-fs`, and any engine command line, e.g.
+URL options: `?args=--nosound` (skip the audio mixer), `?args=--gldebug` (check GL errors after every draw), `?args=--trace-fs`, and any engine command line, e.g.
 `?args=%2Bset%20developer%200`. The dev server (`web/tools/serve.py`) adds the COOP/COEP headers that wasm threads need
 and serves the install dir read-only under `/data/` (never copied or uploaded).
 
@@ -45,6 +50,7 @@ and serves the install dir read-only under `/data/` (never copied or uploaded).
 - `shim/`      Win32 / D3D9 / DirectInput / Winsock / MSVC-CRT compatibility headers + `win32_shim.cpp` (threads/events/critical
                sections over pthreads, overlapped reads) over `kvfs.cpp` (virtual files: POSIX under node; HTTP range
                requests + in-memory writes in the browser; Windows-path + case-insensitive handling).
+- `audio/`     `al_web.cpp`: OpenAL-subset software mixer (own thread) feeding the page's AudioWorklet.
 - `gfx/`       the D3D9→WebGL2 device (`d3d9_gl_device.cpp`: state, FBOs, programs, draws; `d3d9_gl_resources.cpp`: textures,
                buffers, queries, formats) and `shader_xlate.cpp`, the engine-independent D3D9 bytecode→GLSL translator
                (native test driver: `tools/xlate_test.cpp`).
@@ -79,4 +85,12 @@ and serves the install dir read-only under `/data/` (never copied or uploaded).
 - `scrVmGlob` landed directly after `scrVmPub` in memory, so the script VM's "eval stack" pointer (`&scrVmGlob - 1`) aliased
   `scrVmPub.maxstack` and every field read reported "Internal script stack overflow" (separator padding).
 - `VirtualFree(MEM_DECOMMIT)` must not `free()` (the Hunk decommits ranges of one reservation).
+- MSVC CRT semantics the engine relied on: `rand()` returns 0..32767 (the engine divides by 32767/32768/0x8000 and masks with 0x7FFF). The
+  web libc returns up to 2^31, which made `random()` return values up to ~65536 and inflated weapon kick, bullet spread, effects and sound
+  variation. `kisak_rand`/`kisak_srand` (win32_shim.cpp, macros in kisak_compat.h) reproduce MSVC's generator for the C++ engine code.
+- `Lock()` memory must be 16-byte aligned: `R_LockSkinnedCache` rejects a misaligned lock and then skips model skinning for the frame
+  (the viewmodel vanished on alternate frames, since there are two skin-cache buffers). `std::vector` only gives 8-byte alignment in
+  wasm, so buffer/texture shadow memory uses a 64-byte aligned allocator (`Bytes` in `d3d9_gl_internal.h`).
+- `build.py` has no header dependency scanning for engine files (use `--force` after touching `shim/*.h`); web-only sources are rebuilt
+  automatically when any header under `web/` changes.
 - WebGL needs all framebuffer attachments the same size; D3D9 allows a larger depth buffer (substitute depth renderbuffers).

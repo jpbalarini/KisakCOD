@@ -69,6 +69,14 @@ extern "C" int kisak_stat(const char* path, struct stat* st);
 // stdlib.h is already included above, so renaming from here on only affects engine code.
 #define random kisak_random
 
+// The engine was written against MSVC's CRT, where rand() returns 0..32767 (RAND_MAX = 0x7FFF): it divides by 32767/32768/0x8000, masks
+// with 0x7FFF, etc. The web libc's rand() returns up to 2^31-1, which made e.g. random() return values up to ~65536 (weapon kick, spread,
+// effects...). Provide the MSVC generator (same LCG, 15-bit result) for C++ engine code.
+extern "C" int kisak_rand(void);
+extern "C" void kisak_srand(unsigned int seed);
+#define rand() kisak_rand()
+#define srand(seed) kisak_srand(seed)
+
 
 #define CPUSTRING "web-wasm32"
 

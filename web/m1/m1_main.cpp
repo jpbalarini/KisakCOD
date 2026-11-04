@@ -75,6 +75,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--no-profile")) { autoProfile = false; continue; }
         if (!strcmp(argv[i], "--trace-fs")) { setenv("KISAK_TRACE_FS", "1", 1); continue; }
+        if (!strcmp(argv[i], "--nosound")) { setenv("KISAK_NOAUDIO", "1", 1); continue; }
         if (!strcmp(argv[i], "--gldebug")) { setenv("KISAK_GLDEBUG", "1", 1); continue; }
         strncat(cmd, " ", sizeof cmd - strlen(cmd) - 1);
         strncat(cmd, argv[i], sizeof cmd - strlen(cmd) - 1);

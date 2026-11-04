@@ -38,8 +38,9 @@ def sources(target=None):
     res.append('web/shim/win32_shim.cpp')
     res.append('web/shim/kvfs.cpp')
     if target != 'm0':
-        gd = os.path.join(WEB, 'gfx')
-        res += ['web/gfx/' + f for f in sorted(os.listdir(gd)) if f.endswith('.cpp')]
+        for sub in ('gfx', 'audio'):
+            gd = os.path.join(WEB, sub)
+            res += ['web/%s/%s' % (sub, f) for f in sorted(os.listdir(gd)) if f.endswith('.cpp')]
     if target:
         d = os.path.join(WEB, target)
         res += ['web/%s/%s' % (target, f) for f in sorted(os.listdir(d)) if f.endswith(('.cpp', '.c'))]
@@ -49,10 +50,23 @@ def sources(target=None):
 
 def objpath(f): return os.path.join(OBJ, f.replace('/', '__') + '.o')
 
+def newest_web_header():
+    """Newest mtime of any header under web/ (the headers the web-only sources include); a change must rebuild them."""
+    t = 0
+    for d, _, files in os.walk(WEB):
+        if os.path.abspath(d).startswith(BUILD): continue
+        for fn in files:
+            if fn.endswith('.h'): t = max(t, os.path.getmtime(os.path.join(d, fn)))
+    return t
+
+WEB_HDR_MTIME = newest_web_header()
+
 def compile_one(args):
     f, force = args
     src = os.path.join(ROOT, f); obj = objpath(f)
-    if not force and os.path.exists(obj) and os.path.getmtime(obj) >= os.path.getmtime(src):
+    src_time = os.path.getmtime(src)
+    if f.startswith('web/'): src_time = max(src_time, WEB_HDR_MTIME)   # web sources depend on web/ headers (no dependency scanning)
+    if not force and os.path.exists(obj) and os.path.getmtime(obj) >= src_time:
         return f, 0, '', True
     extra = ['-DDR_WAV_IMPLEMENTATION', '-DDR_MP3_IMPLEMENTATION'] if f.endswith('sound/snd_driver_load_obj.cpp') else []
     cmd = (CXX if f.endswith(('.cpp', '.cc')) else CC) + extra + ['-c', src, '-o', obj]

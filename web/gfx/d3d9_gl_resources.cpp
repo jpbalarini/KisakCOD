@@ -284,7 +284,7 @@ void TexCore::ensureGL()
                 glTexSubImage2D(tgt, (GLint)level, 0, 0, (GLsizei)lw, (GLsizei)lh, fi.format, fi.type, data);
             }
             L.dirty = false;
-            if (freeAfter) { std::vector<uint8_t>().swap(L.data); }
+            if (freeAfter) { Bytes().swap(L.data); }
         }
     }
     RestoreActiveUnit();

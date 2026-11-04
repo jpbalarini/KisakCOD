@@ -354,6 +354,11 @@ extern "C" char *kisak_getcwd(char *buf, size_t size) {
     strncpy(buf, r, size); if (size) buf[size - 1] = 0; return buf;
 }
 
+// ------------------------------------------------------------------ MSVC-compatible rand()
+static thread_local uint32_t t_holdrand = 1;   // MSVC keeps one generator per thread, default seed 1
+extern "C" int kisak_rand(void) { t_holdrand = t_holdrand * 214013u + 2531011u; return (int)((t_holdrand >> 16) & 0x7FFF); }
+extern "C" void kisak_srand(unsigned int seed) { t_holdrand = seed; }
+
 // ------------------------------------------------------------------ CRT extras
 extern "C" char *_itoa(int v, char *buf, int radix) {
     if (radix == 10) { sprintf(buf, "%d", v); return buf; }
