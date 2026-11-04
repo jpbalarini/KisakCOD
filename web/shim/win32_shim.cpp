@@ -328,7 +328,11 @@ BOOL GetVersionExA(OSVERSIONINFOA *v) { memset(v->szCSDVersion, 0, sizeof(v->szC
 BOOL GetComputerNameA(LPSTR b, LPDWORD n) { strncpy(b, "WEBCLIENT", *n); return TRUE; }
 BOOL GetUserNameA(LPSTR b, LPDWORD n) { strncpy(b, "player", *n); return TRUE; }
 LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD) { (void)type; if (addr) return addr; void *p = nullptr; if (posix_memalign(&p, 65536, size)) return nullptr; memset(p, 0, size); return p; }
-BOOL VirtualFree(LPVOID addr, SIZE_T, DWORD) { free(addr); return TRUE; }
+BOOL VirtualFree(LPVOID addr, SIZE_T size, DWORD type) {
+    if (type & MEM_RELEASE) { free(addr); return TRUE; }   // release the whole reservation
+    if (type & 0x4000) { if (addr && size) memset(addr, 0, size); return TRUE; }   // MEM_DECOMMIT: keep the pages, hand back zeroes on recommit
+    return TRUE;
+}
 int MessageBoxA(HWND, LPCSTR text, LPCSTR caption, UINT) { fprintf(stderr, "[MessageBox] %s: %s\n", caption ? caption : "", text ? text : ""); return IDOK; }
 SHORT GetAsyncKeyState(int) { return 0; }
 HMODULE GetModuleHandleA(LPCSTR) { return nullptr; }

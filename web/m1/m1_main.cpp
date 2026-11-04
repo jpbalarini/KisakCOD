@@ -15,6 +15,9 @@
 #include <win32/win_local.h>
 #include <win32/win_localize.h>
 #include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <string>
 #include <emscripten.h>
 #include <emscripten/html5.h>
 #include "../shim/kvfs.h"
@@ -23,6 +26,18 @@ extern char sys_cmdline[1024];
 void Sys_FindInfo();
 
 static int g_frames = 0;
+
+// Files the engine writes live in memory (kvfs), so a player profile would have to be created in the UI on every page load.
+// Pre-seed one (players/profiles/active.txt + its directory) so the game starts straight into the main menu.
+static void SeedDefaultProfile()
+{
+    const char *name = "Player";
+    kvfs::mkdir("/cod4/players");
+    kvfs::mkdir("/cod4/players/profiles");
+    kvfs::mkdir(std::string("/cod4/players/profiles/") + name);
+    int h = kvfs::open("/cod4/players/profiles/active.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    if (h >= 0) { kvfs::write(h, name, strlen(name)); kvfs::close(h); }
+}
 
 static double g_lastReport = 0;
 static int g_framesAtReport = 0;
@@ -46,6 +61,7 @@ int main(int argc, char **argv)
     setenv("KISAK_INSTALL_PATH", "/cod4", 0);
     kvfs::init("/cod4");
 
+    (void)0;
     Sys_InitializeCriticalSections();
     Sys_InitMainThread();
     track_init();
@@ -54,8 +70,10 @@ int main(int argc, char **argv)
     Dvar_Init();
     InitTiming();
     Sys_FindInfo();
-    char cmd[1024] = "+set r_fullscreen 0 +set developer 1 +set sv_pure 0";
+    char cmd[1024] = "+set r_fullscreen 0 +set developer 1 +set sv_pure 0 +set com_introPlayed 1";
+    bool autoProfile = true;
     for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--no-profile")) { autoProfile = false; continue; }
         if (!strcmp(argv[i], "--trace-fs")) { setenv("KISAK_TRACE_FS", "1", 1); continue; }
         if (!strcmp(argv[i], "--gldebug")) { setenv("KISAK_GLDEBUG", "1", 1); continue; }
         strncat(cmd, " ", sizeof cmd - strlen(cmd) - 1);
@@ -65,6 +83,7 @@ int main(int argc, char **argv)
     Sys_Milliseconds();
     Profile_Init();
     Profile_InitContext(0);
+    if (autoProfile) SeedDefaultProfile();
     fprintf(stderr, "[m1] Com_Init...\n");
     Com_Init(sys_cmdline);
     fprintf(stderr, "[m1] Com_Init done, entering frame loop\n");

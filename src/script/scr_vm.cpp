@@ -66,6 +66,11 @@ void Log(char const *format, ...)
 #pragma warning( disable : 4146 ) // LWSS: disable C4146 `unary minus operator applied to unsigned type, result still unsigned`. This is used somewhat properly here (-Scr_ReadUnsignedShort())
 
 scrVmPub_t scrVmPub;
+#ifdef KISAK_WEB
+// GetEntityFieldValue() points scrVmPub.top at (VariableValue*)&scrVmGlob - 1, which must never equal scrVmPub.maxstack
+// (IncInParam treats that as stack overflow). With scrVmGlob laid out directly after scrVmPub in wasm memory it did.
+__attribute__((used)) static char s_scrVmSeparator[128];
+#endif
 scrVmGlob_t scrVmGlob;
 jmp_buf g_script_error[33];
 scrVmDebugPub_t scrVmDebugPub;
@@ -4248,7 +4253,9 @@ void IncInParam()
     }
     Scr_ClearOutParams();
     if (scrVmPub.top == scrVmPub.maxstack)
+    {
         Sys_Error("Internal script stack overflow");
+    }
     ++scrVmPub.top;
     ++scrVmPub.inparamcount;
     if ((scrVmPub.top < (VariableValue*)&scrVmGlob || scrVmPub.top > &scrVmGlob.eval_stack[1])

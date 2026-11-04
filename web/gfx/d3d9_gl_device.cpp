@@ -11,6 +11,7 @@
 #include <string.h>
 #include <algorithm>
 #include <set>
+#include <tuple>
 
 namespace d3dgl {
 
@@ -265,8 +266,25 @@ struct Device : RefImpl<IDirect3DDevice9> {
         }
     }
 
+    // D3D9 lets a render target use a (larger) depth buffer of a different size; WebGL requires matching attachment sizes.
+    // Substitute a private depth(-stencil) renderbuffer of exactly the colour size (contents are not shared, but depth is
+    // cleared at the start of each pass in practice).
+    std::map<std::tuple<UINT, UINT, int>, Surface *> depthSubstitutes;
+    Surface *matchingDepth(Surface *color, Surface *depth)
+    {
+        if (!color || !depth || (depth->w == color->w && depth->h == color->h)) return depth;
+        auto key = std::make_tuple(color->w, color->h, (int)depth->fmt);
+        auto it = depthSubstitutes.find(key);
+        if (it != depthSubstitutes.end()) return it->second;
+        Surface *s = new Surface(this);
+        s->kind = Surface::K_RENDERBUFFER; s->w = color->w; s->h = color->h; s->fmt = depth->fmt; s->usage = D3DUSAGE_DEPTHSTENCIL;
+        depthSubstitutes[key] = s;
+        return s;
+    }
+
     GLuint getFBO(Surface *const *colors, Surface *depth)
     {
+        depth = matchingDepth(colors[0], depth);
         FboKey k;
         for (int i = 0; i < 4; ++i) k.c[i] = colors[i] ? colors[i]->id : 0;
         k.d = depth ? depth->id : 0;

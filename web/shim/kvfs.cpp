@@ -396,6 +396,15 @@ bool listdir(const std::string &dir, std::vector<Entry> *out)
             found = true;
         }
     }
+    for (const std::string &d : g_memDirs) {          // in-memory subdirectories
+        size_t sl = d.rfind('/');
+        if (sl == std::string::npos || d.substr(0, sl) != ld) continue;
+        std::string nm = d.substr(sl + 1);
+        bool dup = false;
+        for (auto &e : *out) if (strcasecmp(e.name.c_str(), nm.c_str()) == 0) { dup = true; break; }
+        if (!dup) out->push_back(Entry{nm, true, 0});
+        found = true;
+    }
     if (g_memDirs.count(ld)) found = true;
     if (!found) return false;
     out->push_back(Entry{".", true, 0});

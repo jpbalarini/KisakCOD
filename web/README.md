@@ -13,10 +13,12 @@ the engine sources under `src/` carry only small patches (see `git diff`).
   (all 826 shaders in the startup zones translate and compile). Renders CoD4's real menus (profile selection screen)
   at ~65 fps from the Mac fastfiles, which are streamed to the engine over HTTP range requests from a local dev server.
   No GL errors with `?args=--gldebug`.
-- **M2 (next):** player profile + keyboard/mouse input, loading screen while a map loads, map rendering (`+devmap mp_crash`
-  currently stops at "You have not chosen a profile yet"), CPU skinning (`R_SkinXSurfaceSkinnedSse` is not built yet),
-  depth-texture shadow maps, `texkill`/MRT corner cases. **M3:** audio (Web Audio backend for the OpenAL/EFX layer).
-  **M4:** WebSocket networking.
+- **M2 (done):** playable offline. `?args=%2Bdevmap%20mp_crash` loads the real `mp_crash` map, runs the real GSC scripts, shows the
+  loading screen, the team/class menus and drops you into first person (M16A4 viewmodel, HUD, minimap); keyboard + mouse work
+  (`platform/input_web.cpp`), ~45 fps in game, 0 GL errors. A "Player" profile is pre-seeded so you skip the profile screen.
+- **Next:** M3 audio (Web Audio backend for the OpenAL/EFX layer), M4 WebSocket multiplayer. Known rough edges: menu frames are slow
+  (~12 fps, blur passes), the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour fallback,
+  occlusion queries report 0, Bink/Steam are stubs, profile/config files are memory-only (lost on reload), no gamepad.
 
 ## Build & run (needs emscripten, python3, node)
 ```bash
@@ -33,6 +35,8 @@ python3 web/tools/survey.py                 # syntax-check every TU, grouped by 
 python3 web/tools/build.py --link m1        # -> web/build/m1/index.{html,js,wasm}
 web/run_m1.sh                               # serves it + your game data on http://localhost:8080 (open in Chrome)
 ```
+Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser swallows Esc while the pointer is locked, so the
+loss of pointer lock is turned back into an Esc press). `--no-profile` shows the profile screen instead of seeding one.
 URL options: `?args=--gldebug` (check GL errors after every draw), `?args=--trace-fs`, and any engine command line, e.g.
 `?args=%2Bset%20developer%200`. The dev server (`web/tools/serve.py`) adds the COOP/COEP headers that wasm threads need
 and serves the install dir read-only under `/data/` (never copied or uploaded).
@@ -66,3 +70,13 @@ and serves the install dir read-only under `/data/` (never copied or uploaded).
 - D3D9→GL conventions fixed in the translated vertex shader: z [0,w]→[-w,w], y flip (render targets keep D3D row order,
   Present blits flipped), half-pixel offset. D3D alpha-test / sRGB-write render states are emulated in the pixel shader.
 - The process "cwd" is the install root (`Sys_Cwd` is the engine's base path) and relative paths resolve against it.
+
+## Engine/ABI bugs found while bringing up M2 (all fixed; none are wasm-specific logic bugs in the game)
+- A `char` parameter's address was read as a `uint32_t` by a callback (`Dvar_InfoString`): fine on x86 where the stack slot is
+  zero-extended, garbage in wasm → random dvars leaked into the server-info string and truncated it (empty `mapname`).
+- `XAssetHeader` is a union passed by value; the wasm C ABI passes unions by reference, so a table entry that cast
+  `Image_Free(GfxImage*)` to `void(*)(XAssetHeader)` received a pointer to the union (`DB_RemoveImage` wrapper).
+- `scrVmGlob` landed directly after `scrVmPub` in memory, so the script VM's "eval stack" pointer (`&scrVmGlob - 1`) aliased
+  `scrVmPub.maxstack` and every field read reported "Internal script stack overflow" (separator padding).
+- `VirtualFree(MEM_DECOMMIT)` must not `free()` (the Hunk decommits ranges of one reservation).
+- WebGL needs all framebuffer attachments the same size; D3D9 allows a larger depth buffer (substitute depth renderbuffers).

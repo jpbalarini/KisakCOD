@@ -28,12 +28,7 @@ qboolean Sys_StringToAdr(const char *, netadr_t *) { STUB("Sys_StringToAdr"); re
 char __cdecl Sys_SendPacket(int, unsigned __int8 *, netadr_t) { STUB("Sys_SendPacket"); return 0; }
 bool Sys_IsLANAddress(netadr_t) { return false; }
 
-// ---- input (win_input.cpp) ----
-void IN_Frame(void) {}
-void IN_ActivateMouse(qboolean) {}
-void __cdecl IN_SetCursorPos(tagPOINT) {}
-bool __cdecl IN_IsForegroundWindow() { return true; }
-void __cdecl IN_SetForegroundWindow() {}
+// ---- input: see input_web.cpp ----
 
 // ---- voice (win_voice.cpp) ----
 double __cdecl Voice_GetVoiceLevel() { return 0.0; }
@@ -51,8 +46,6 @@ void __cdecl R_CreateReflectionRawDataFromCubemapShot(struct DiskGfxReflectionPr
 #include <win32/win_net.h>
 
 // ---- input / net / voice lifecycle (real implementations arrive with M3/M4)
-void IN_Init(void) {}
-void IN_Shutdown(void) {}
 void NET_Init(void) {}
 void NET_Restart(void) {}
 uint32_t __cdecl NET_TCPIPSocket(const char *, int, int) { STUB("NET_TCPIPSocket"); return (uint32_t)-1; }
@@ -108,4 +101,12 @@ void alFilterf(ALuint, ALenum, ALfloat) {}
 void alGenAuxiliaryEffectSlots(ALsizei n, ALuint *s) { for (ALsizei i = 0; i < n; ++i) s[i] = i + 1; }
 void alDeleteAuxiliaryEffectSlots(ALsizei, const ALuint *) {}
 void alAuxiliaryEffectSloti(ALuint, ALenum, ALint) {}
+}
+
+// ---- MMX skinning kernel (r_model_skin_sse.cpp): never selected because sys_info.SSE is 0 in the web build
+#include <gfx_d3d/r_model_skin.h>
+void __cdecl R_SkinXSurfaceSkinnedSse(const XSurface *, const DObjSkelMat *, GfxPackedVertexNormal *, GfxPackedVertexNormal *, GfxPackedVertex *)
+{
+    fprintf(stderr, "R_SkinXSurfaceSkinnedSse called in the web build (sys_SSE should be off)\n");
+    __builtin_trap();
 }

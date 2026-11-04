@@ -163,7 +163,9 @@ char *__cdecl Dvar_InfoString(int localClientNum, char bit)
     const char *UsernameForLocalClient; // eax
 
     info1[0] = 0;
-    Dvar_ForEach((void(__cdecl *)(const dvar_s *, void *))Dvar_InfoStringSingle, &bit);
+    // the callback reads *userData as 32 bits: pass a full uint32_t (the old &bit relied on the x86 stack slot being zero-extended)
+    uint32_t bitMask = (uint8_t)bit;
+    Dvar_ForEach((void(__cdecl *)(const dvar_s *, void *))Dvar_InfoStringSingle, &bitMask);
 #ifdef KISAK_MP
     if ((bit & 2) != 0)
     {

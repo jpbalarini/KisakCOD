@@ -19,6 +19,7 @@
 #include <universal/timing.h>
 #include <gfx_d3d/r_init.h>
 #include <universal/profile.h>
+#include <emscripten.h>
 
 char sys_cmdline[1024];
 char sys_exitCmdLine[1024];
@@ -133,6 +134,7 @@ void Sys_Error(const char *error, ...)
     va_end(va);
     fprintf(stderr, "\n*** Sys_Error: %s\n", string);
     fflush(stderr);
+    emscripten_log(EM_LOG_CONSOLE | EM_LOG_C_STACK | EM_LOG_NO_PATHS, "Sys_Error call stack:");
     exit(1);
 }
 
@@ -189,7 +191,7 @@ void Sys_FindInfo()
     sys_info.cpuGHz = 3.0;
     sys_info.sysMB = Sys_SystemMemoryMB();
     strcpy(sys_info.gpuDescription, "WebGL2");
-    sys_info.SSE = 1;
+    sys_info.SSE = 0;   // wasm has no SSE/MMX skinning kernels: use the portable C skinning path
     strcpy(sys_info.cpuVendor, "WebAssembly");
     strcpy(sys_info.cpuName, "wasm32 simd128");
     Sys_SetAutoConfigureGHz(&sys_info);

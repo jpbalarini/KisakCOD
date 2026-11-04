@@ -2918,6 +2918,13 @@ LABEL_4:
     }
 }
 
+// The handler table passes XAssetHeader (a union) by value. In the wasm C ABI a union is passed by reference, so calling
+// Image_Free(GfxImage*) through that signature handed it a pointer to the union instead of the image.
+static void __cdecl DB_RemoveImage(XAssetHeader header)
+{
+    Image_Free(header.image);
+}
+
 void(__cdecl *DB_RemoveXAssetHandler[ASSET_TYPE_COUNT])(XAssetHeader) =
 {
   NULL,
@@ -2926,7 +2933,7 @@ void(__cdecl *DB_RemoveXAssetHandler[ASSET_TYPE_COUNT])(XAssetHeader) =
   NULL,
   NULL,
   (void(*)(XAssetHeader)) & Material_ReleaseTechniqueSet,
-  (void(*)(XAssetHeader)) & Image_Free,
+  &DB_RemoveImage,
   NULL,
   NULL,
   &DB_RemoveLoadedSound,

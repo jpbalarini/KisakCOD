@@ -8,7 +8,7 @@ def link_m1(target, objs, root, web, build):
         '-sSTACK_SIZE=8388608', '-sDEFAULT_PTHREAD_STACK_SIZE=4194304', '-sSUPPORT_LONGJMP=wasm',
         '-sEMULATE_FUNCTION_POINTER_CASTS=1', '--profiling-funcs', '-sERROR_ON_UNDEFINED_SYMBOLS=0', '-sWARN_ON_UNDEFINED_SYMBOLS=1',
         '-sENVIRONMENT=web,worker', '-sEXIT_RUNTIME=0', '-sASSERTIONS=1',
-        '-sPROXY_TO_PTHREAD', '-sOFFSCREENCANVAS_SUPPORT', '-sOFFSCREEN_FRAMEBUFFER', '-sMIN_WEBGL_VERSION=2', '-sMAX_WEBGL_VERSION=2']
+        '--pre-js', os.path.join(web, 'm1', 'prejs.js'), '-sPROXY_TO_PTHREAD', '-sOFFSCREENCANVAS_SUPPORT', '-sOFFSCREEN_FRAMEBUFFER', '-sMIN_WEBGL_VERSION=2', '-sMAX_WEBGL_VERSION=2']
     p = subprocess.run(cmd, capture_output=True, text=True)
     open(os.path.join(out_dir, 'link.log'), 'w').write(p.stdout + p.stderr)
     jsf = os.path.join(out_dir, 'index.js')
