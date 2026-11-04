@@ -1078,6 +1078,7 @@ void __cdecl Com_Init(char* commandLine)
     v3 = (jmp_buf *)Sys_GetValue(2);
     if (!setjmp(*v3))
         Com_AddStartupCommands();
+
     if (com_errorEntered)
         Com_ErrorCleanup();
 
@@ -2384,7 +2385,7 @@ void Com_CheckError()
     if (v0)
     {
         void * value = Sys_GetValue(2);
-        longjmp((int*)value, -1);
+        longjmp(*(jmp_buf*)value, -1);
     }
 }
 

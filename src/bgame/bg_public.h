@@ -587,7 +587,7 @@ enum MissileFlightMode : __int32
     MISSILEFLIGHTMODE_DIRECT = 0x1,
 };
 
-enum team_t;
+#include <game/teams.h>  // web-port: clang rejects MSVC-style forward declaration of an enum with a fixed underlying type
 #ifdef KISAK_MP
 struct corpse_ent_t // sizeof=0x4
 {                                       // ...

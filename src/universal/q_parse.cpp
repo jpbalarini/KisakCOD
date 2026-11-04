@@ -159,7 +159,6 @@ void Com_ScriptErrorDrop(const char *msg, ...)
     va_start(va, msg);
     ParseThreadInfo = Com_GetParseThreadInfo();
     v3 = &ParseThreadInfo->parseInfo[ParseThreadInfo->parseInfoNum];
-    va_copy(ap, va);
     _vsnprintf(string, 0x1000u, msg, va);
     ap = 0;
     if (ParseThreadInfo->parseInfoNum)
@@ -179,7 +178,6 @@ void Com_ScriptError(const char *msg, ...)
     va_start(va, msg);
     ParseThreadInfo = Com_GetParseThreadInfo();
     v3 = &ParseThreadInfo->parseInfo[ParseThreadInfo->parseInfoNum];
-    va_copy(ap, va);
     _vsnprintf(string, 0x1000u, msg, va);
     ap = 0;
     if (ParseThreadInfo->parseInfoNum)

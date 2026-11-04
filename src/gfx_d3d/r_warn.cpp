@@ -63,7 +63,6 @@ void R_WarnOncePerFrame(GfxWarningType warnType, ...)
     if (s_warnCount[warnType] < rg.frontEndFrameCount)
     {
         s_warnCount[warnType] = rg.frontEndFrameCount + (int)(frameRate * r_warningRepeatDelay->current.value);
-        va_copy(vargs, va);
         _vsnprintf(message, 0x400u, s_warnFormat[warnType], va);
         vargs = 0;
         Com_PrintWarning(CON_CHANNEL_GFX, "%s\n", message);

@@ -440,7 +440,7 @@
          Material_PreventOverrideTechniqueGeneration();
  }
 
- static void __cdecl R_WarnInitDvars()
+ static void __cdecl R_WarnInitDvars_Local()
  {
      DvarLimits min; // [esp+4h] [ebp-10h]
 
@@ -1478,7 +1478,7 @@
          (char *)"",
          DVAR_ARCHIVE | DVAR_LATCH,
          "Special resolution mode for the remote debugger");
-     R_WarnInitDvars();
+     R_WarnInitDvars_Local();
      prof_probe[0] = Dvar_RegisterEnum("prof_probe0", prof_enumNames, 0, DVAR_NOFLAG, "Profile probe");
      prof_probe[1] = Dvar_RegisterEnum("prof_probe1", prof_enumNames, 0, DVAR_NOFLAG, "Profile probe");
      prof_probe[2] = Dvar_RegisterEnum("prof_probe2", prof_enumNames, 0, DVAR_NOFLAG, "Profile probe");

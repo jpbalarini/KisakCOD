@@ -170,7 +170,7 @@ struct __declspec(align(8)) SysInfo // sizeof=0x260
 
 // LWSS add
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(KISAK_WEB)
 extern _RTL_CRITICAL_SECTION s_criticalSections[];
 #else
 extern std::mutex s_criticalSections[];

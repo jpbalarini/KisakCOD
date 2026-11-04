@@ -2947,7 +2947,13 @@ void __cdecl R_BeginRegistration(vidConfig_t *vidConfigOut)
     iassert(vidConfigOut);
     memcpy(vidConfigOut, &vidConfig, sizeof(vidConfig_t));
     iassert(!r_glob.startedRenderThread);
+#ifdef KISAK_WEB
+    // The WebGL context belongs to the main engine thread, so the "render thread" never takes over (no remote screen updates);
+    // the back end runs inline on the main thread (sys_smp_allowed == 0).
+    r_glob.startedRenderThread = 0;
+#else
     r_glob.startedRenderThread = 1;
+#endif
     R_ReleaseThreadOwnership();
 }
 

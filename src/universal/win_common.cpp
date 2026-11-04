@@ -12,7 +12,7 @@
 #include "com_memory.h"
 #include "profile.h"
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(KISAK_WEB)
 _RTL_CRITICAL_SECTION s_criticalSections[CRITSECT_COUNT];
 #else
 #include <mutex>
@@ -22,7 +22,7 @@ uint32_t s_criticalSectionsCount[CRITSECT_COUNT] = { 0 };
 
 void Sys_InitializeCriticalSections()
 {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(KISAK_WEB)
 	for (int critSect = 0; critSect < CRITSECT_COUNT; critSect++) {
 		InitializeCriticalSection(&s_criticalSections[critSect]);
 	}
@@ -34,7 +34,7 @@ void Sys_EnterCriticalSection(int critSect)
     PROF_SCOPED("Sys_EnterCriticalSection");
 
 	iassert(critSect >= 0 && critSect < CRITSECT_COUNT);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(KISAK_WEB)
 	EnterCriticalSection(&s_criticalSections[critSect]);
 #else
     s_criticalSections[critSect].lock();
@@ -47,7 +47,7 @@ void Sys_EnterCriticalSection(int critSect)
 void Sys_LeaveCriticalSection(int critSect)
 {
 	iassert(critSect >= 0 && critSect < CRITSECT_COUNT);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(KISAK_WEB)
 	LeaveCriticalSection(&s_criticalSections[critSect]);
 #else
     s_criticalSectionsCount[critSect]--;

@@ -1,4 +1,5 @@
 #pragma once
+#include <universal/q_shared.h> // web-port: `byte` typedef must be visible even when included first
 
 #include <d3d9.h>
 
