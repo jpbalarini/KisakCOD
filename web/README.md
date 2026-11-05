@@ -54,6 +54,9 @@ gesture the browser wants before it lets audio play, so sound starts without a s
 data on the server, and an estimate of "menus + the largest recorded map" from the load traces below, x1.25 for what the traces miss; until the
 traces exist it shows the total instead). If the browser cannot run the game (page not cross-origin isolated, e.g. plain `http://<lan ip>`; no WebGL 2)
 the screen says so and disables Start instead of showing a black canvas. `?autostart` skips the button (for development and scripts).
+**Quit** (menu -> Quit -> Yes, or the `quit` command) tears the engine down and reloads the page back to this start screen (`Sys_Quit` in
+`platform/sys_web.cpp` stops the frame loop and calls `kisakGameExited()` in `app/shell.html`). Before, `exit(0)` left the browser's frame loop running
+against the freed UI and the log filled with `Could not find menu 'main'` forever.
 
 Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser swallows Esc while the pointer is locked, so the
 loss of pointer lock is turned back into an Esc press). The pointer is only locked while the player controls the game: not while a menu, the

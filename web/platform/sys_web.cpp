@@ -145,9 +145,18 @@ void __cdecl Sys_OpenURL(const char *url, int doexit)
         Cbuf_AddText(0, "quit\n");
 }
 
+// Set by Sys_Quit: the browser frame loop (app/main.cpp) must not run another frame. By then Com_Quit_f has torn the engine down (UI, menus,
+// filesystem), and the loop is a browser timer that exit() does not stop: it kept calling Com_Frame, which printed "Could not find menu 'main'"
+// forever.
+bool g_webQuitting = false;
+
 void __cdecl Sys_Quit()
 {
     fflush(stdout);
+    g_webQuitting = true;
+    emscripten_cancel_main_loop();
+    // Back to the start screen: the page reloads itself (a fresh page also frees the engine's memory and workers). No such function under node.
+    MAIN_THREAD_ASYNC_EM_ASM({ if (typeof kisakGameExited === 'function') kisakGameExited(); });
     exit(0);
 }
 

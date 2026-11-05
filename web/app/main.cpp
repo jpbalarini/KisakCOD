@@ -46,8 +46,11 @@ static int g_framesAtReport = 0;
 
 static double g_lastFrameMs = 0;
 
+extern bool g_webQuitting;   // platform/sys_web.cpp: the engine has quit (Quit in the menu / the quit command)
+
 static void FrameCb(void *)
 {
+    if (g_webQuitting) return;
     Com_Frame();
     ++g_frames;
     double now = emscripten_get_now();

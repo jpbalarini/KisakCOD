@@ -199,6 +199,13 @@
   // ---------------------------------------------------------------------------------------------------------------------------------------
   // the game
   // ---------------------------------------------------------------------------------------------------------------------------------------
+  // ---- the engine quit (Quit in the menu): back to the start screen. Reloading is the clean way: the engine's memory, its worker threads and the
+  // I/O worker's cache handles all go away, and the page comes up on the start screen again (without ?autostart, which would just restart it).
+  function kisakGameExited() {
+    const u = new URL(location.href);
+    u.searchParams.delete('autostart');
+    location.replace(u.href);
+  }
   var logEl = document.getElementById('log');
   function addLog(s) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
   // ---- audio: the engine's mixer thread (web/audio/al_web.cpp) calls this once its device opens. The AudioContext starts
