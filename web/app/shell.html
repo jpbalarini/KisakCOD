@@ -22,6 +22,20 @@
   // ---- audio: the engine's mixer thread (web/audio/al_web.cpp) calls this once its device opens. The AudioContext starts
   // suspended (autoplay policy) and is resumed by the first click/key press.
   var kisakAudio = {};
+  // ---- game data I/O: kvfs.cpp calls this once; io-worker.js then serves the engine's blocking range reads (persistent cache, parallel fetches).
+  function kisakIoAttach(mem, ctlPtr) {
+    const args = (new URLSearchParams(location.search).get('args') || '').split(' ');
+    const msg = { memory: mem, ctl: ctlPtr, base: location.origin, nocache: args.includes('--nocache'), clear: args.includes('--clearcache'), learn: args.includes('--learn') };
+    try {
+      const w = new Worker('io-worker.js');
+      w.onerror = (e) => { addLog('[io] worker error: ' + e.message); };
+      w.onmessage = (ev) => { const m = ev.data; if (m && m.type === 'log') addLog(m.text); };   // the worker's [io] lines
+      w.postMessage(msg);
+    } catch (e) {
+      addLog('[io] could not start the I/O worker: ' + e);
+      const I = new Int32Array(mem.buffer); Atomics.store(I, (ctlPtr >> 2) + 1, 2); Atomics.notify(I, (ctlPtr >> 2) + 1);
+    }
+  }
   async function kisakAudioAttach(sab, ctlPtr, ringPtr, ringFrames) {
     try {
       const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });

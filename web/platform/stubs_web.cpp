@@ -1,5 +1,5 @@
 // stubs_web.cpp -- web-build stand-ins for engine entry points that live in files not (yet) built for the browser:
-//   win_net.cpp (Winsock) -> M4 WebSocket transport      win_input.cpp (DirectInput) -> browser input events
+//   win_net.cpp (Winsock) -> net_web.cpp                 win_input.cpp (DirectInput) -> browser input events
 //   win_voice.cpp (voice chat)                           r_screenshot.cpp (GDI+ cubemap capture, dev tools only)
 //   r_model_skin_sse.cpp (MMX skinning) -> wasm-simd rewrite
 // Each stub logs once so we notice when a code path that needs a real implementation is reached.
@@ -21,12 +21,7 @@ static void stubHit(const char *name)
 }
 #define STUB(name) stubHit(name)
 
-// ---- networking (win_net.cpp) ----
-const char *NET_ErrorString(void) { return "networking not available in the web build yet"; }
-void NET_Sleep(int msec) { Sleep(msec); }
-qboolean Sys_StringToAdr(const char *, netadr_t *) { STUB("Sys_StringToAdr"); return 0; }
-char __cdecl Sys_SendPacket(int, unsigned __int8 *, netadr_t) { STUB("Sys_SendPacket"); return 0; }
-bool Sys_IsLANAddress(netadr_t) { return false; }
+// ---- networking (win_net.cpp): see net_web.cpp ----
 
 // ---- input: see input_web.cpp ----
 
@@ -46,12 +41,6 @@ void __cdecl R_CreateReflectionRawDataFromCubemapShot(struct DiskGfxReflectionPr
 #include <win32/win_net.h>
 
 // ---- input / net / voice lifecycle (real implementations arrive with M3/M4)
-void NET_Init(void) {}
-void NET_Restart(void) {}
-uint32_t __cdecl NET_TCPIPSocket(const char *, int, int) { STUB("NET_TCPIPSocket"); return (uint32_t)-1; }
-qboolean Sys_GetPacket(netadr_t *, msg_t *) { return 0; }
-bool Sys_IsLANAddress_IgnoreSubnet(netadr_t) { return false; }
-void Sys_ShowIP() {}
 void __cdecl Sys_ShowConsole() {}
 bool __cdecl Voice_Init() { return true; }
 void __cdecl Voice_Playback() {}

@@ -20,7 +20,17 @@ static const char *kCanvas = "#canvas";
 
 static std::unordered_map<std::string, int> g_keyMap;
 static bool g_inited = false;
-static bool g_hadPointerLock = false;
+static bool g_hadPointerLock = false;   // the browser reports the pointer as locked
+static bool g_unlockedByUs = false;     // we asked for the current/next unlock (it is not the player pressing Esc)
+static bool g_wantedLock = false;       // WantPointerLock() as of the previous frame
+
+// Should the browser hold the pointer (first-person aiming from relative motion)? Only while the player controls the game. A menu or the
+// console is driven by the *absolute* pointer position, which a locked pointer stops reporting (the cursor freezes), and
+// CL_IsLocalClientInGame() is already true while the team / class menus are open after joining.
+static bool WantPointerLock()
+{
+    return CL_IsLocalClientInGame(0) && !Key_IsCatcherActive(0, KEYCATCH_UI | KEYCATCH_CONSOLE | KEYCATCH_SCRIPT);
+}
 
 // accumulated mouse state, consumed by IN_Frame
 static int g_mouseX = 0, g_mouseY = 0, g_dx = 0, g_dy = 0;
@@ -113,8 +123,8 @@ static bool OnMouseButton(int type, const EmscriptenMouseEvent *e, void *)
     if (!key) return false;
     bool down = type == EMSCRIPTEN_EVENT_MOUSEDOWN;
     Sys_QueEvent(0, SE_KEY, key, down ? 1 : 0, 0, 0);
-    // capture the mouse for first-person control while a game is running
-    if (down && CL_IsLocalClientInGame(0)) emscripten_request_pointerlock(kCanvas, true);
+    // capture the mouse for first-person control while the player is controlling the game (not while a menu has the cursor)
+    if (down && WantPointerLock()) emscripten_request_pointerlock(kCanvas, true);
     return true;
 }
 
@@ -130,10 +140,11 @@ static bool OnWheel(int, const EmscriptenWheelEvent *e, void *)
 // press so the in-game menu opens.
 static bool OnPointerLockChange(int, const EmscriptenPointerlockChangeEvent *e, void *)
 {
-    if (g_hadPointerLock && !e->isActive) {
+    if (g_hadPointerLock && !e->isActive && !g_unlockedByUs) {
         Sys_QueEvent(0, SE_KEY, K_ESCAPE, 1, 0, 0);
         Sys_QueEvent(0, SE_KEY, K_ESCAPE, 0, 0, 0);
     }
+    g_unlockedByUs = false;
     g_hadPointerLock = e->isActive != 0;
     return true;
 }
@@ -161,6 +172,18 @@ void __cdecl IN_Shutdown() {}
 
 void __cdecl IN_Frame()
 {
+    // A menu opened while the pointer is locked (the game opens one by itself, e.g. after dying or on a team change): give the pointer back so the
+    // menu cursor can move. When the menu closes, ask to lock again; the browser performs the request at the next click or key press.
+    const bool want = WantPointerLock();
+    if (!want && g_hadPointerLock) {
+        if (!g_unlockedByUs) {               // (once: the browser confirms the unlock a few frames later)
+            g_unlockedByUs = true;
+            emscripten_exit_pointerlock();
+        }
+    } else if (want && !g_wantedLock && !g_hadPointerLock) {
+        emscripten_request_pointerlock(kCanvas, true);
+    }
+    g_wantedLock = want;
     if (g_mouseMoved) {
         int dx = g_dx, dy = g_dy;
         g_dx = g_dy = 0;

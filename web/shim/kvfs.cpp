@@ -2,9 +2,11 @@
 #include "kvfs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -15,6 +17,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <emscripten.h>
 
 #undef stat
@@ -63,7 +66,7 @@ static bool posixResolve(const std::string &path, std::string &out)
 }
 
 // ====================================================================== HTTP backend
-struct RemoteFile { std::string rel; uint64_t size; };
+struct RemoteFile { std::string rel; uint64_t size; uint32_t id; };
 struct MemFile { std::vector<uint8_t> data; std::mutex m; };
 
 static std::map<std::string, RemoteFile> g_remote;                 // lower(rel path) -> info
@@ -78,7 +81,11 @@ struct Handle {
     std::string rel; uint64_t size = 0;      // remote
     int64_t pos = 0;
     bool writable = false, append = false;
-    int64_t cacheOff = -1; std::vector<uint8_t> cache;
+    // remote read state (see remoteRead): sequential-stream detection + a private buffer for streaming reads
+    uint32_t fileId = 0;
+    int streak = 0;                  // consecutive fetches that continued right where the previous one ended
+    int64_t fetchEnd = -1;           // end offset of the previous fetch
+    int64_t sOff = -1; std::vector<uint8_t> sbuf;   // stream buffer: [sOff, sOff + sbuf.size())
 };
 static std::vector<Handle> g_handles;
 static const int kHandleBase = 1000;
@@ -112,6 +119,113 @@ EM_JS(int, kvfs_fetch_range, (const char *relPath, double off, int len, void *ds
     return n;
 });
 
+// ---- bridge to web/app/io-worker.js ------------------------------------------------------------------------------------------------
+// All remote range reads go through the I/O worker (persistent cache + parallel fetches). Each calling thread owns one request slot in a
+// control block in shared memory, posts its request and blocks on it. If the worker cannot start, the reads fall back to plain sync XHR.
+static const int kIoSlots = 16, kIoSlotWords = 8, kIoSlot0 = 8;
+alignas(64) static volatile int32_t g_ioCtl[kIoSlot0 + kIoSlots * kIoSlotWords];
+static int g_ioState = 0;                                  // 0 not started, 1 ready, 2 unavailable
+static std::atomic<int> g_ioNextSlot{0};
+
+// Asks the page (main thread) to start the worker, then waits for its ready flag. 1 = persistent cache, 3 = network only, 2/0 = unavailable.
+static int ioStart()
+{
+    MAIN_THREAD_ASYNC_EM_ASM({
+        if (typeof kisakIoAttach === 'function') kisakIoAttach(wasmMemory, $0);
+        else { const I = new Int32Array(wasmMemory.buffer); Atomics.store(I, ($0 >> 2) + 1, 2); Atomics.notify(I, ($0 >> 2) + 1); }
+    }, (uintptr_t)g_ioCtl);
+    return EM_ASM_INT({
+        const I = HEAP32;
+        const w = ($0 >> 2) + 1;
+        const t0 = Date.now();
+        while (Atomics.load(I, w) === 0 && Date.now() - t0 < 20000) Atomics.wait(I, w, 0, 100);
+        return Atomics.load(I, w);
+    }, (uintptr_t)g_ioCtl);
+}
+
+// Blocking range read through the worker. Returns bytes read, or < 0 (-3: this thread has no slot).
+EM_JS(int, kvfs_io_call, (int32_t *ctl, int slot, const char *path, double off, int len, void *dst), {
+    const I = HEAP32, b = (ctl >> 2) + 8 + slot * 8;
+    Atomics.store(I, b + 1, path);
+    Atomics.store(I, b + 2, off % 4294967296 | 0);
+    Atomics.store(I, b + 3, Math.floor(off / 4294967296));
+    Atomics.store(I, b + 4, len);
+    Atomics.store(I, b + 5, dst);
+    Atomics.store(I, b, 1);
+    Atomics.add(I, ctl >> 2, 1);
+    Atomics.notify(I, ctl >> 2);
+    while (Atomics.load(I, b) !== 2) Atomics.wait(I, b, Atomics.load(I, b), 1000);
+    const r = Atomics.load(I, b + 6);
+    Atomics.store(I, b, 0);
+    return r;
+});
+
+static int ioFetch(const std::string &rel, int64_t off, int len, void *dst)
+{
+    static thread_local int slot = -2;
+    if (slot == -2) { int s = g_ioNextSlot.fetch_add(1); slot = s < kIoSlots ? s : -1; }
+    if (slot < 0) return -3;
+    return kvfs_io_call((int32_t *)g_ioCtl, slot, rel.c_str(), (double)off, len, dst);
+}
+
+// ---- request statistics (KISAK_FSSTATS=1 / `--fsstats`): what the engine reads and what it costs ----------------------------------
+struct FsStat { uint64_t opens = 0, reqs = 0, fetched = 0, wanted = 0; double ms = 0; };
+static std::map<std::string, FsStat> g_stats;
+static std::mutex g_statMutex;
+static double g_statLast = 0, g_statStart = 0;
+static bool statsOn() { return getenv("KISAK_FSSTATS") != nullptr; }   // not cached: files are opened before main() parses --fsstats
+
+static void dumpStats()
+{
+    FsStat tot; std::vector<std::pair<std::string, FsStat>> rows;
+    for (auto &kv : g_stats) { rows.push_back(kv); tot.opens += kv.second.opens; tot.reqs += kv.second.reqs; tot.fetched += kv.second.fetched; tot.wanted += kv.second.wanted; tot.ms += kv.second.ms; }
+    std::sort(rows.begin(), rows.end(), [](auto &a, auto &b) { return a.second.fetched > b.second.fetched; });
+    fprintf(stderr, "[fsstats] t=%.1fs  %llu requests, %.1f MB fetched (%.1f MB wanted by the engine), %.1fs blocked in fetches (all threads), %llu opens\n",
+            (emscripten_get_now() - g_statStart) / 1000.0, (unsigned long long)tot.reqs, tot.fetched / 1048576.0, tot.wanted / 1048576.0, tot.ms / 1000.0, (unsigned long long)tot.opens);
+    if (g_ioState == 1)
+        fprintf(stderr, "[fsstats] I/O worker: %d network requests (%.1f MB), %d requests served from the persistent cache (%.1f MB), %d read-aheads\n",
+                g_ioCtl[2], g_ioCtl[3] / 1024.0, g_ioCtl[4], g_ioCtl[5] / 1024.0, g_ioCtl[6]);
+    for (size_t i = 0; i < rows.size() && i < 8; ++i) {
+        const FsStat &f = rows[i].second;
+        fprintf(stderr, "[fsstats]   %-40s %6llu req %8.1f MB fetched %8.1f MB wanted  %6.1fs  %5llu opens\n", rows[i].first.c_str(), (unsigned long long)f.reqs,
+                f.fetched / 1048576.0, f.wanted / 1048576.0, f.ms / 1000.0, (unsigned long long)f.opens);
+    }
+}
+
+static int rawFetch(const std::string &rel, int64_t off, int len, void *dst)
+{
+    if (g_ioState == 1) {
+        int r = ioFetch(rel, off, len, dst);
+        if (r >= 0) return r;                              // (-3 = no slot for this thread, < -3 / -1 / -2 = worker failed: use XHR)
+    }
+    return kvfs_fetch_range(rel.c_str(), (double)off, len, dst);
+}
+
+static int fetchRange(const std::string &rel, int64_t off, int len, void *dst)
+{
+    if (!statsOn()) return rawFetch(rel, off, len, dst);
+    double t0 = emscripten_get_now();
+    int r = rawFetch(rel, off, len, dst);
+    double t1 = emscripten_get_now();
+    std::lock_guard<std::mutex> g(g_statMutex);
+    if (g_statStart == 0) g_statStart = t0;
+    FsStat &st = g_stats[rel];
+    st.reqs++; st.ms += t1 - t0; if (r > 0) st.fetched += (uint64_t)r;
+    if (t1 - g_statLast > 5000) { g_statLast = t1; dumpStats(); }
+    return r;
+}
+static void noteWanted(const std::string &rel, size_t n, int64_t off, uint64_t fileSize)
+{
+    if (!statsOn()) return;
+    std::lock_guard<std::mutex> g(g_statMutex);
+    g_stats[rel].wanted += n;
+    const char *tr = getenv("KISAK_FSSTATS");
+    static int shown = 0;
+    // trace mode: log the first reads of .iwd files outside their central directory (the last ~400 KB)
+    if (tr && tr[0] == '2' && shown < 500 && rel.find(".iwd") != std::string::npos && (uint64_t)off + 400000 < fileSize) { ++shown; fprintf(stderr, "[fsread] %s off=%lld n=%zu\n", rel.c_str(), (long long)off, n); }
+}
+static void noteOpen(const std::string &rel) { if (statsOn()) { std::lock_guard<std::mutex> g(g_statMutex); g_stats[rel].opens++; } }
+
 static void parseManifest(const char *json)
 {
     // {"files": {"main/a.iwd": 123, ...}}   (written by web/tools/serve.py; paths contain no escapes beyond \\ and \")
@@ -133,7 +247,7 @@ static void parseManifest(const char *json)
         while (*p && *p != ':') ++p;
         if (*p == ':') ++p;
         uint64_t size = strtoull(p, (char **)&p, 10);
-        g_remote[lower(name)] = RemoteFile{name, size};
+        g_remote[lower(name)] = RemoteFile{name, size, (uint32_t)g_remote.size()};
         // directory index
         std::string dir;
         size_t start = 0;
@@ -170,6 +284,9 @@ void init(const char *installRoot)
     parseManifest(json);
     free(json);
     fprintf(stderr, "[kvfs] browser backend: %zu remote files under %s\n", g_remote.size(), g_rootExact.c_str());
+    int io = ioStart();
+    g_ioState = (io == 1 || io == 3) ? 1 : 2;
+    fprintf(stderr, "[kvfs] data I/O: %s\n", io == 1 ? "worker with persistent cache" : io == 3 ? "worker, network only (cache unavailable or in use by another tab)" : "plain XHR (worker unavailable)");
 }
 
 // returns true if `path` is below the install root; sets rel (relative path, original case as given)
@@ -216,8 +333,9 @@ int open(const std::string &path, int of)
         }
         const RemoteFile *rf = findRemote(path);
         if (!rf) { errno = ENOENT; return -1; }
-        int h = allocHandle(); Handle *hd = handleOf(h); hd->rel = rf->rel; hd->size = rf->size;
+        int h = allocHandle(); Handle *hd = handleOf(h); hd->rel = rf->rel; hd->size = rf->size; hd->fileId = rf->id;
         if (traceFs()) fprintf(stderr, "[kvfs] open remote %s (%llu bytes)\n", rf->rel.c_str(), (unsigned long long)rf->size);
+        noteOpen(rf->rel);
         return h;
     }
     std::shared_ptr<MemFile> mf;
@@ -241,27 +359,111 @@ int close(int h)
     return 0;
 }
 
-static int64_t remoteRead(Handle *hd, void *buf, size_t n, int64_t off)
+// ---- remote reads: shared block cache + sequential read-ahead --------------------------------------------------------------------
+// The engine reads the .iwd archives (167 MB each) with tiny reads (3 B, 1 KB, a few KB) at scattered offsets, and the .ff fastfiles
+// with big sequential reads. Both go through synchronous XHR range requests, so cost = requests x round-trip + bytes / bandwidth.
+//  * Random reads: fetch only the 64 KB blocks that cover the read (about one round trip, ~1.5x the bytes actually needed) and keep them
+//    in a global LRU cache shared by all handles, so neighbouring reads, re-opened files and other threads hit the cache. (The previous
+//    1 MB per-handle blocks fetched ~6x more data than the engine used, up to 17x for some archives.)
+//  * Sequential reads: when a read misses right where the previous fetch ended, the fetch window doubles (128 KB ... 4 MB). Large windows
+//    go to a private per-handle stream buffer instead of the LRU, so streaming a 57 MB fastfile does not flush the archive blocks.
+static const int64_t kGran = 64 * 1024;                    // cache block size
+static const int kMaxStreak = 6;                           // window = kGran << streak: 128 KB ... 4 MB
+static const int kStreamStreak = 3;                        // windows of 512 KB and up use the stream buffer
+static const size_t kCacheBudget = 96u << 20;              // bytes of cached blocks
+
+struct CBlock { std::vector<uint8_t> data; std::list<uint64_t>::iterator lru; };
+static std::unordered_map<uint64_t, CBlock> g_blocks;      // key = fileId << 32 | block index
+static std::list<uint64_t> g_lru;                          // most recently used first
+static size_t g_cacheBytes = 0;
+static std::mutex g_cacheMutex;
+static inline uint64_t blockKey(uint32_t file, int64_t blk) { return ((uint64_t)file << 32) | (uint64_t)blk; }
+
+static void cacheInsert(uint32_t file, int64_t blk, const uint8_t *src, size_t len)   // g_cacheMutex held
 {
+    uint64_t k = blockKey(file, blk);
+    if (g_blocks.count(k)) return;
+    g_lru.push_front(k);
+    CBlock &b = g_blocks[k];
+    b.data.assign(src, src + len);
+    b.lru = g_lru.begin();
+    g_cacheBytes += len;
+    while (g_cacheBytes > kCacheBudget && g_lru.size() > 1) {
+        uint64_t victim = g_lru.back();
+        g_lru.pop_back();
+        auto it = g_blocks.find(victim);
+        g_cacheBytes -= it->second.data.size();
+        g_blocks.erase(it);
+    }
+}
+
+static int64_t remoteRead(Handle *hd, void *vbuf, size_t n, int64_t off)
+{
+    uint8_t *buf = (uint8_t *)vbuf;
     if (off >= (int64_t)hd->size) return 0;
     if ((uint64_t)off + n > hd->size) n = (size_t)(hd->size - off);
     if (!n) return 0;
-    const size_t kBlock = 1 << 20;
-    if (n >= kBlock / 4) {   // large reads go straight into the destination
-        int r = kvfs_fetch_range(hd->rel.c_str(), (double)off, (int)n, buf);
+    noteWanted(hd->rel, n, off, hd->size);
+    const int64_t size = (int64_t)hd->size, end = off + (int64_t)n;
+    if (n >= (4u << 20)) {   // huge reads go straight into the destination (no staging copy)
+        int r = fetchRange(hd->rel, off, (int)n, buf);
         return r < 0 ? -1 : r;
     }
-    if (!(hd->cacheOff >= 0 && off >= hd->cacheOff && (uint64_t)(off + n) <= (uint64_t)hd->cacheOff + hd->cache.size())) {
-        int64_t blockStart = off & ~(int64_t)(kBlock - 1);
-        size_t len = (size_t)std::min<uint64_t>(kBlock, hd->size - blockStart);
-        hd->cache.resize(len);
-        int r = kvfs_fetch_range(hd->rel.c_str(), (double)blockStart, (int)len, hd->cache.data());
-        if (r < 0) return -1;
-        hd->cache.resize((size_t)r);
-        hd->cacheOff = blockStart;
-        if (!(off >= hd->cacheOff && (uint64_t)(off + n) <= (uint64_t)hd->cacheOff + hd->cache.size())) n = (size_t)std::max<int64_t>(0, hd->cacheOff + (int64_t)hd->cache.size() - off);
+    int64_t pos = off;
+    while (pos < end) {
+        // 1. the handle's stream buffer
+        if (hd->sOff >= 0 && pos >= hd->sOff && pos < hd->sOff + (int64_t)hd->sbuf.size()) {
+            size_t c = (size_t)std::min<int64_t>(end - pos, hd->sOff + (int64_t)hd->sbuf.size() - pos);
+            memcpy(buf + (pos - off), hd->sbuf.data() + (pos - hd->sOff), c);
+            pos += (int64_t)c;
+            continue;
+        }
+        // 2. the shared block cache
+        int64_t blk = pos / kGran;
+        {
+            std::lock_guard<std::mutex> g(g_cacheMutex);
+            auto it = g_blocks.find(blockKey(hd->fileId, blk));
+            if (it != g_blocks.end()) {
+                g_lru.splice(g_lru.begin(), g_lru, it->second.lru);
+                const std::vector<uint8_t> &d = it->second.data;
+                int64_t inBlk = pos - blk * kGran;
+                size_t c = (size_t)std::min<int64_t>(end - pos, (int64_t)d.size() - inBlk);
+                memcpy(buf + (pos - off), d.data() + inBlk, c);
+                pos += (int64_t)c;
+                continue;
+            }
+        }
+        // 3. miss: one range request. A miss right where the previous fetch ended continues a sequential stream: grow the window.
+        bool sequential = hd->fetchEnd >= 0 && pos >= hd->fetchEnd && pos - hd->fetchEnd <= kGran;
+        hd->streak = sequential ? std::min(hd->streak + 1, kMaxStreak) : 0;
+        int64_t window = hd->streak ? (kGran << hd->streak) : 0;
+        bool stream = hd->streak >= kStreamStreak;
+        int64_t from = stream ? pos : blk * kGran;
+        int64_t to = std::max(end, pos + window);
+        to = std::min(size, (to + kGran - 1) / kGran * kGran);
+        if (stream) to = std::min(size, std::max(to, end));
+        size_t len = (size_t)(to - from);
+        std::vector<uint8_t> tmp(len);
+        int r = fetchRange(hd->rel, from, (int)len, tmp.data());
+        if (r <= 0) return pos > off ? pos - off : -1;
+        hd->fetchEnd = from + r;
+        if (stream) {
+            hd->sbuf.swap(tmp);
+            hd->sbuf.resize((size_t)r);
+            hd->sOff = from;
+        } else {
+            std::lock_guard<std::mutex> g(g_cacheMutex);
+            for (int64_t b = from / kGran; b * kGran < from + r; ++b) {
+                int64_t bs = b * kGran;
+                size_t bl = (size_t)std::min<int64_t>(kGran, from + r - bs);
+                if (bl == (size_t)std::min<int64_t>(kGran, size - bs)) cacheInsert(hd->fileId, b, tmp.data() + (bs - from), bl);   // whole blocks only
+            }
+            // serve this read straight from the fetched bytes (the blocks may be evicted by another thread before the next loop)
+            int64_t avail = std::min<int64_t>(end, from + r);
+            if (avail > pos) { memcpy(buf + (pos - off), tmp.data() + (pos - from), (size_t)(avail - pos)); pos = avail; }
+        }
+        if (stream) continue;   // next iteration copies from the stream buffer
     }
-    memcpy(buf, hd->cache.data() + (off - hd->cacheOff), n);
     return (int64_t)n;
 }
 

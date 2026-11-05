@@ -1,4 +1,4 @@
-// dinput.h shim -- DirectInput is replaced by browser input events in the web build (see web/m0, later web/input).
+// dinput.h shim -- DirectInput is replaced by browser input events in the web build (see web/platform/input_web.cpp).
 // Only the typedefs that engine headers (win_local.h) mention are provided.
 #pragma once
 #include <Windows.h>

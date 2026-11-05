@@ -1,7 +1,7 @@
-// M0 harness: boot the real KisakCOD core (dvars, cmd, filesystem, memory, database thread) under node/wasm32
+// Node load test (the first milestone's harness): boot the real KisakCOD core (dvars, cmd, filesystem, memory, database thread) under node/wasm32
 // and load the stock fastfiles from the Mac retail data with the *unmodified* engine loader.
 //
-//   KISAK_INSTALL_PATH=".../Call of Duty 4 Data" node web/build/m0/m0.js [zone ...]
+//   KISAK_INSTALL_PATH=".../Call of Duty 4 Data" node web/build/loadtest/loadtest.js [zone ...]
 #include <universal/q_shared.h>
 #include <Windows.h>
 #include <client/client.h>
@@ -22,7 +22,7 @@
 #include <gfx_d3d/r_bsp.h>
 #include <gfx_d3d/r_gfx.h>
 
-#define STEP(name) do { fprintf(stderr, "[m0] %s\n", name); fflush(stderr); } while (0)
+#define STEP(name) do { fprintf(stderr, "[loadtest] %s\n", name); fflush(stderr); } while (0)
 
 extern char sys_cmdline[1024];
 void Sys_FindInfo();
@@ -57,7 +57,7 @@ static void __cdecl EnumCb(XAssetHeader h, void *ud)
     EnumCtx *c = (EnumCtx *)ud;
     if (c->shown < 2) {
         const char *nm = DB_GetXAssetHeaderName(c->type, &h);
-        fprintf(stderr, "[m0]      e.g. %s '%s'\n", kTypeNames[c->type], nm ? nm : "?");
+        fprintf(stderr, "[loadtest]      e.g. %s '%s'\n", kTypeNames[c->type], nm ? nm : "?");
         c->shown++;
     }
     c->count++;
@@ -65,15 +65,15 @@ static void __cdecl EnumCb(XAssetHeader h, void *ud)
 
 static void ReportAssets(const char *title)
 {
-    fprintf(stderr, "[m0] ===== asset report: %s (heap %.1f MB) =====\n", title, emscripten_get_heap_size() / 1048576.0);
+    fprintf(stderr, "[loadtest] ===== asset report: %s (heap %.1f MB) =====\n", title, emscripten_get_heap_size() / 1048576.0);
     int total = 0;
     for (int t = 0; t < ASSET_TYPE_COUNT; ++t) {
         EnumCtx c = { (XAssetType)t, 0, 0 };
         DB_EnumXAssets((XAssetType)t, EnumCb, &c, 0);
-        if (c.count) fprintf(stderr, "[m0]   %-13s %6d\n", kTypeNames[t], c.count);
+        if (c.count) fprintf(stderr, "[loadtest]   %-13s %6d\n", kTypeNames[t], c.count);
         total += c.count;
     }
-    fprintf(stderr, "[m0]   total assets   %6d\n", total);
+    fprintf(stderr, "[loadtest]   total assets   %6d\n", total);
 }
 
 // ---- shader bytecode survey (M1 design input): what do the Mac fastfiles carry inside techsets?
@@ -115,13 +115,13 @@ static void ShaderSurveyRun()
 {
     ShaderSurvey s;
     DB_EnumXAssets(ASSET_TYPE_TECHNIQUE_SET, TechsetCb, &s, 0);
-    fprintf(stderr, "[m0] shader survey: techsets=%d techniques=%d passes=%d uniqueVS=%zu uniquePS=%zu nullVS=%u nullPS=%u\n",
+    fprintf(stderr, "[loadtest] shader survey: techsets=%d techniques=%d passes=%d uniqueVS=%zu uniquePS=%zu nullVS=%u nullPS=%u\n",
             s.techsets, s.techniques, s.passes, s.vs.size(), s.ps.size(), s.vsNull, s.psNull);
-    for (auto &kv : s.vsVer) fprintf(stderr, "[m0]   VS version token %08x : %d\n", kv.first, kv.second);
-    for (auto &kv : s.psVer) fprintf(stderr, "[m0]   PS version token %08x : %d\n", kv.first, kv.second);
-    for (auto &kv : s.vsRenderer) fprintf(stderr, "[m0]   VS loadForRenderer %u : %d\n", kv.first, kv.second);
-    for (auto &kv : s.psRenderer) fprintf(stderr, "[m0]   PS loadForRenderer %u : %d\n", kv.first, kv.second);
-    fprintf(stderr, "[m0]   max VS words=%u PS words=%u\n", s.maxVsWords, s.maxPsWords);
+    for (auto &kv : s.vsVer) fprintf(stderr, "[loadtest]   VS version token %08x : %d\n", kv.first, kv.second);
+    for (auto &kv : s.psVer) fprintf(stderr, "[loadtest]   PS version token %08x : %d\n", kv.first, kv.second);
+    for (auto &kv : s.vsRenderer) fprintf(stderr, "[loadtest]   VS loadForRenderer %u : %d\n", kv.first, kv.second);
+    for (auto &kv : s.psRenderer) fprintf(stderr, "[loadtest]   PS loadForRenderer %u : %d\n", kv.first, kv.second);
+    fprintf(stderr, "[loadtest]   max VS words=%u PS words=%u\n", s.maxVsWords, s.maxPsWords);
     if (const char *dir = getenv("SHADER_DUMP_DIR")) {
         int n = 0;
         for (const void *p : s.vs) { auto *v = (const MaterialVertexShader *)p; char fn[512];
@@ -130,12 +130,12 @@ static void ShaderSurveyRun()
         for (const void *p : s.ps) { auto *v = (const MaterialPixelShader *)p; char fn[512];
             snprintf(fn, sizeof fn, "%s/ps_r%u_%04d_%s.bin", dir, v->prog.loadDef.loadForRenderer, n, v->name);
             if (FILE *f = fopen(fn, "wb")) { fwrite(v->prog.loadDef.program, 4, v->prog.loadDef.programSize, f); fclose(f); ++n; } }
-        fprintf(stderr, "[m0] dumped %d shaders to %s\n", n, dir);
+        fprintf(stderr, "[loadtest] dumped %d shaders to %s\n", n, dir);
     }
     if (!s.vs.empty()) {
         auto *v = (MaterialVertexShader *)*s.vs.begin();
         const unsigned *w = (const unsigned *)v->prog.loadDef.program;
-        fprintf(stderr, "[m0]   first VS '%s' words=%u:", v->name, v->prog.loadDef.programSize);
+        fprintf(stderr, "[loadtest]   first VS '%s' words=%u:", v->name, v->prog.loadDef.programSize);
         for (int i = 0; i < 12 && i < v->prog.loadDef.programSize; ++i) fprintf(stderr, " %08x", w[i]);
         fprintf(stderr, "\n");
     }
@@ -148,22 +148,22 @@ static void CheckContents()
     const char *raws[] = { "maps/mp/gametypes/dm.gsc", "maps/mp/_utility.gsc" };
     for (const char *name : raws) {
         RawFile *rf = DB_FindXAssetHeader(ASSET_TYPE_RAWFILE, name).rawfile;
-        fprintf(stderr, "[m0] rawfile '%s': len=%d first bytes: '%.40s'\n", name, rf->len, rf->buffer);
+        fprintf(stderr, "[loadtest] rawfile '%s': len=%d first bytes: '%.40s'\n", name, rf->len, rf->buffer);
     }
     LocalizeEntry *le = DB_FindXAssetHeader(ASSET_TYPE_LOCALIZE_ENTRY, "MENU_MULTIPLAYER").localize;
-    fprintf(stderr, "[m0] localize MENU_MULTIPLAYER = '%s'\n", le->value);
+    fprintf(stderr, "[loadtest] localize MENU_MULTIPLAYER = '%s'\n", le->value);
 }
 
 static void __cdecl GfxWorldCb(XAssetHeader h, void *)
 {
     GfxWorld *gw = h.gfxWorld;
-    fprintf(stderr, "[m0] GfxWorld '%s': surfaces=%d vertices=%u indices=%d planes=%d nodes=%d reflectionProbes=%u\n",
+    fprintf(stderr, "[loadtest] GfxWorld '%s': surfaces=%d vertices=%u indices=%d planes=%d nodes=%d reflectionProbes=%u\n",
             gw->name, gw->surfaceCount, gw->vertexCount, gw->indexCount, gw->planeCount, gw->nodeCount, gw->reflectionProbeCount);
 }
 static void __cdecl ClipMapCb(XAssetHeader h, void *)
 {
     clipMap_t *cm = h.clipMap;
-    fprintf(stderr, "[m0] clipMap '%s': planes=%d staticModels=%u materials=%u brushSides=%u\n",
+    fprintf(stderr, "[loadtest] clipMap '%s': planes=%d staticModels=%u materials=%u brushSides=%u\n",
             cm->name, cm->planeCount, cm->numStaticModels, cm->numMaterials, cm->numBrushSides);
 }
 static void CheckMap(const char *)
@@ -182,7 +182,7 @@ static void LoadZones(const char *const *extra, int extraCount)
     zi[n++] = { "common_mp", DB_ZONE_COMMON, 0 };
     zi[n++] = { "localized_common_mp", DB_ZONE_COMMON_LOC, 0 };
     for (int i = 0; i < extraCount && n < 8; ++i) zi[n++] = { extra[i], DB_ZONE_GAME, 0 };
-    fprintf(stderr, "[m0] DB_LoadXAssets(%d zones)\n", n);
+    fprintf(stderr, "[loadtest] DB_LoadXAssets(%d zones)\n", n);
     DB_LoadXAssets(zi, n, 0);   // same as R_LoadGraphicsAssets: async request ...
     DB_SyncXAssets();           // ... then wait for the database thread (sync=1 would hold the hash write-lock)
 }
@@ -191,10 +191,10 @@ static void LoadZones(const char *const *extra, int extraCount)
 #include <chrono>
 static void StartWatchdog()
 {
-    const char *e = getenv("M0_WATCHDOG_SEC");
+    const char *e = getenv("LOADTEST_WATCHDOG_SEC");
     if (!e) return;
     int sec = atoi(e);
-    std::thread([sec] { std::this_thread::sleep_for(std::chrono::seconds(sec)); fprintf(stderr, "[m0] watchdog fired after %d s\n", sec); fflush(stderr); exit(3); }).detach();
+    std::thread([sec] { std::this_thread::sleep_for(std::chrono::seconds(sec)); fprintf(stderr, "[loadtest] watchdog fired after %d s\n", sec); fflush(stderr); exit(3); }).detach();
 }
 
 int main(int argc, char **argv)
@@ -220,7 +220,7 @@ int main(int argc, char **argv)
     STEP("Win_InitLocalization");
     Win_InitLocalization();
 
-    fprintf(stderr, "[m0] bring-up ok (language=%s)\n", Win_GetLanguage());
+    fprintf(stderr, "[loadtest] bring-up ok (language=%s)\n", Win_GetLanguage());
 
     // --- trimmed Com_Init_Try_Block_Function: everything the fastfile loader needs, nothing that needs a window ---
     STEP("Com_ParseCommandLine");
@@ -244,14 +244,14 @@ int main(int argc, char **argv)
     {   // sanity-check the directory listing shim against the engine's own Sys_ListFiles
         char dir[512]; snprintf(dir, sizeof(dir), "%s/main", getenv("KISAK_INSTALL_PATH"));
         int n = -1; char **l = Sys_ListFiles(dir, "iwd", nullptr, &n, 0);
-        fprintf(stderr, "[m0] Sys_ListFiles(main, iwd) -> %d files (first: %s)\n", n, l && l[0] ? l[0] : "-");
+        fprintf(stderr, "[loadtest] Sys_ListFiles(main, iwd) -> %d files (first: %s)\n", n, l && l[0] ? l[0] : "-");
         n = -1; l = Sys_ListFiles(dir, "/", nullptr, &n, 1);
-        fprintf(stderr, "[m0] Sys_ListFiles(main, dirs) -> %d\n", n);
+        fprintf(stderr, "[loadtest] Sys_ListFiles(main, dirs) -> %d\n", n);
     }
     {   // is the zone file visible from the main thread / from a worker thread?
         char p[600]; snprintf(p, sizeof(p), "%s\\zone\\english\\code_post_gfx_mp.ff", getenv("KISAK_INSTALL_PATH"));
         HANDLE h = CreateFileA(p, 0x80000000, 1, 0, 3, 0x60000000u, 0);
-        fprintf(stderr, "[m0] main-thread CreateFileA(zone) -> %s (GetFileSize=%lu)\n", h == INVALID_HANDLE_VALUE ? "INVALID" : "ok", h == INVALID_HANDLE_VALUE ? 0ul : GetFileSize(h, 0));
+        fprintf(stderr, "[loadtest] main-thread CreateFileA(zone) -> %s (GetFileSize=%lu)\n", h == INVALID_HANDLE_VALUE ? "INVALID" : "ok", h == INVALID_HANDLE_VALUE ? 0ul : GetFileSize(h, 0));
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     }
     STEP("FS_InitFilesystem");
@@ -265,12 +265,12 @@ int main(int argc, char **argv)
 
     STEP("load zones");
     LoadZones(argc > 1 ? argv + 1 : nullptr, argc > 1 ? argc - 1 : 0);
-    fprintf(stderr, "[m0] startup zones loaded (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
+    fprintf(stderr, "[loadtest] startup zones loaded (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
     ReportAssets("startup zones (code, ui, common, localized)");
-    fprintf(stderr, "[m0] after ReportAssets (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
+    fprintf(stderr, "[loadtest] after ReportAssets (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
     CheckContents();
     ShaderSurveyRun();
-    fprintf(stderr, "[m0] after CheckContents (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
+    fprintf(stderr, "[loadtest] after CheckContents (hash lock r=%d w=%d)\n", (int)db_hashCritSect.readCount, (int)db_hashCritSect.writeCount);
 
     // Load a multiplayer map the way SV_SpawnServer does: "<map>_load" (loading-screen zone) then the map zone itself.
     const char *map = "mp_crash";
@@ -286,10 +286,10 @@ int main(int argc, char **argv)
         unsigned t0 = Sys_Milliseconds();
         DB_LoadXAssets(&zm, 1, 0);
         DB_SyncXAssets();
-        fprintf(stderr, "[m0] map zone loaded in %u ms\n", Sys_Milliseconds() - t0);
+        fprintf(stderr, "[loadtest] map zone loaded in %u ms\n", Sys_Milliseconds() - t0);
     }
     ReportAssets("after mp_crash");
     CheckMap(map);
-    fprintf(stderr, "[m0] M0 COMPLETE\n");
+    fprintf(stderr, "[loadtest] COMPLETE\n");
     return 0;
 }

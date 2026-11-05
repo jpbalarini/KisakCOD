@@ -4,7 +4,7 @@
 // Why not Emscripten's built-in OpenAL: it is a JS library that needs an AudioContext, which does not exist in the worker the
 // engine runs in. So this file implements buffers, sources (static + queued/streaming), looping, pitch, gain and stereo
 // panning itself and mixes on a dedicated pthread into a ring buffer that lives in wasm memory. On the page, an AudioWorklet
-// (web/m1/audio-worklet.js) reads that ring buffer through the shared memory and plays it - see shell.html.
+// (web/app/audio-worklet.js) reads that ring buffer through the shared memory and plays it - see shell.html.
 //
 // The engine does its own distance attenuation (it bakes it into AL_GAIN and sets AL_DISTANCE_MODEL to AL_NONE) and places the
 // AL listener at the origin, so spatialisation here is only a left/right pan from the source position. EFX (reverb/filters)

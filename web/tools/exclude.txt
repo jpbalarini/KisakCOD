@@ -3,7 +3,8 @@
 src/win32/win_input.cpp          # DirectInput -> browser input events (web/platform)
 src/win32/win_wndproc.cpp        # Win32 window procedure -> canvas/DOM events
 src/win32/win_syscon.cpp         # Win32 system console window
-src/win32/win_net.cpp            # Winsock UDP -> WebSocket transport (M4)
+src/win32/win_net.cpp            # Winsock UDP -> WebSocket transport (platform/net_web.cpp)
+src/win32/win_steam.cpp          # Steamworks auth -> browser identity (platform/steam_web.cpp)
 src/win32/win_voice.cpp          # DirectSound voice capture
 src/groupvoice/record_dsound.cpp # DirectSound voice
 src/groupvoice/play_dsound.cpp   # DirectSound voice
