@@ -1,26 +1,208 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>KisakCOD web</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#050806">
+<title>Call of Duty 4: Modern Warfare</title>
 <style>
-  html, body { margin: 0; background: #111; color: #ccc; font: 13px monospace; height: 100%; }
-  #wrap { display: flex; flex-direction: column; height: 100%; }
+  :root {
+    --bg: #050806; --fg: #eef1ea; --muted: #a2ada0; --accent: #8fd3b6; --accent-hi: #b9f0d7; --accent-ink: #04110b;
+    --line: rgba(143, 211, 182, .28); --warn: #f0b765;
+    --display: "Bahnschrift", "DIN Condensed", "Oswald", "Arial Narrow", "Haettenschweiler", Impact, sans-serif;
+    --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  [hidden] { display: none !important; }
+
+  /* ================= start screen: nothing of the game (wasm, workers, data) is requested until Start is pressed ================= */
+  #start { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; overflow: auto; background: var(--bg);
+           font: 16px/1.55 var(--body); transition: opacity .45s ease; }
+  #start.leaving { opacity: 0; pointer-events: none; }
+
+  /* the key art, slowly drifting; a shade keeps the left side (where the text sits) dark; film grain on top */
+  .bg { position: fixed; inset: 0; background: url(hero.webp) 70% 38% / cover no-repeat; transform-origin: 72% 38%;
+        animation: drift 48s ease-in-out infinite alternate; }
+  .shade { position: fixed; inset: 0; background:
+             linear-gradient(90deg, rgba(4, 7, 5, .96) 0%, rgba(4, 7, 5, .82) 30%, rgba(4, 7, 5, .22) 60%, rgba(4, 7, 5, 0) 78%),
+             radial-gradient(130% 100% at 72% 40%, transparent 52%, rgba(0, 0, 0, .65) 100%); }
+  .grain { position: fixed; inset: 0; opacity: .1; mix-blend-mode: overlay; pointer-events: none;
+           background-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .9 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  @keyframes drift { from { transform: scale(1.03); } to { transform: scale(1.11) translate3d(-1.2%, .6%, 0); } }
+
+  .panel { position: relative; z-index: 2; box-sizing: border-box; width: min(100%, 900px); margin: 0; padding: clamp(28px, 6vw, 88px) clamp(28px, 7vw, 120px); }
+  .panel::before { content: ""; position: absolute; left: clamp(12px, 3.4vw, 56px); top: 14%; bottom: 14%; width: 1px;
+                   background: linear-gradient(transparent, var(--accent), transparent); opacity: .55; }
+  .panel > * { opacity: 0; transform: translateY(14px); animation: rise .75s cubic-bezier(.2, .7, .2, 1) forwards; animation-delay: calc(var(--i, 0) * 90ms + 120ms); }
+  .panel > :nth-child(1) { --i: 0; } .panel > :nth-child(2) { --i: 1; } .panel > :nth-child(3) { --i: 2; } .panel > :nth-child(4) { --i: 3; }
+  .panel > :nth-child(5) { --i: 4; } .panel > :nth-child(6) { --i: 5; } .panel > :nth-child(7) { --i: 6; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+
+  .eyebrow { display: flex; align-items: center; gap: 14px; margin: 0 0 14px; color: var(--accent); font: 600 12.5px/1 var(--body); letter-spacing: .32em; text-transform: uppercase; }
+  .eyebrow i { width: 44px; height: 1px; background: var(--accent); }
+  h1 { margin: 0 0 clamp(22px, 4vw, 40px); font-family: var(--display); font-weight: 700; text-transform: uppercase; line-height: .88; }
+  h1 .t1 { display: block; font-size: clamp(46px, 8.2vw, 100px); letter-spacing: .02em; text-shadow: 0 6px 40px rgba(0, 0, 0, .55); }
+  h1 .t1 b { color: var(--accent); font-weight: 700; margin-left: .12em; }
+  h1 .t2 { display: block; margin-top: .2em; color: var(--accent); font-size: clamp(20px, 3.2vw, 44px); font-weight: 600; letter-spacing: .34em; }
+
+  .label { margin: 0 0 8px; color: var(--muted); font: 600 12px/1.5 var(--body); letter-spacing: .28em; text-transform: uppercase; }
+  .big { margin: 0; font: 700 clamp(46px, 6.4vw, 76px)/1 var(--display); letter-spacing: .01em; font-variant-numeric: tabular-nums; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+  .chips li { padding: 6px 12px; border: 1px solid var(--line); background: rgba(5, 8, 6, .5); backdrop-filter: blur(6px);
+              color: var(--fg); font: 500 13px/1 var(--body); letter-spacing: .04em; }
+  .chips b { color: var(--accent); font-weight: 600; }
+  .note { margin: 18px 0 0; max-width: 46ch; color: var(--muted); font-size: 14.5px; }
+  .problem { margin: 18px 0 0; max-width: 50ch; padding: 11px 14px; border: 1px solid var(--warn); background: rgba(240, 183, 101, .08); color: var(--warn); font-size: 14px; }
+
+  .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 18px 24px; margin-top: clamp(24px, 4vw, 40px); }
+  .start { appearance: none; position: relative; display: inline-flex; align-items: center; gap: 16px; border: 0; padding: 19px 30px 19px 40px; background: var(--accent); color: var(--accent-ink);
+           font: 700 22px/1 var(--display); letter-spacing: .28em; text-transform: uppercase; cursor: pointer;
+           clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+           transition: background .15s ease, transform .15s ease; }
+  .start svg { width: 22px; height: 22px; transition: transform .15s ease; }
+  .start:hover:not(:disabled) { background: var(--accent-hi); transform: translateX(3px); }
+  .start:hover:not(:disabled) svg { transform: translateX(6px); }
+  .start:focus-visible { outline: 2px solid var(--fg); outline-offset: 4px; }
+  .start:disabled { background: #36413b; color: #7d8a82; cursor: not-allowed; }
+  .glow { filter: drop-shadow(0 0 22px rgba(143, 211, 182, .35)); }
+  .hint { color: var(--muted); font-size: 13px; }
+  kbd { display: inline-block; padding: 3px 8px; border: 1px solid var(--line); border-radius: 3px; color: var(--fg); font: 600 11.5px/1 var(--body); letter-spacing: .14em; text-transform: uppercase; }
+  .fine { margin: 28px 0 0; max-width: 54ch; color: #6f7a71; font-size: 12px; }
+
+  @media (max-width: 760px) {
+    #start { align-items: flex-end; }
+    .bg { background-position: 76% 24%; }
+    .shade { background: linear-gradient(0deg, rgba(4, 7, 5, .97) 0%, rgba(4, 7, 5, .9) 46%, rgba(4, 7, 5, .25) 78%, rgba(4, 7, 5, 0) 100%); }
+    .panel { padding: 24px 22px 28px 30px; }
+    .panel::before { left: 14px; top: 6%; bottom: 6%; }
+    .start { padding: 17px 24px 17px 30px; font-size: 20px; }
+    .hint { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bg { animation: none; transform: scale(1.04); }
+    .panel > * { animation: none; opacity: 1; transform: none; }
+    #start, .start, .start svg { transition: none; }
+  }
+
+  /* ================= the game ================= */
+  #wrap { display: flex; flex-direction: column; height: 100%; font: 13px monospace; color: #ccc; background: #111; }
   canvas { display: block; margin: 0 auto; background: #000; max-width: 100%; cursor: none; outline: none; }
   #log { flex: 1; overflow: auto; white-space: pre-wrap; padding: 6px; border-top: 1px solid #333; min-height: 80px; }
 </style>
 </head>
 <body>
-<div id="wrap">
+
+<main id="start" aria-labelledby="title">
+  <div class="bg" aria-hidden="true"></div>
+  <div class="shade" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <section class="panel">
+    <p class="eyebrow"><i></i>Browser edition</p>
+    <h1 id="title"><span class="t1">Call of Duty<b>4</b></span><span class="t2">Modern Warfare</span></h1>
+
+    <div id="dl" hidden>
+      <p class="label" id="sizeLabel">Download on first start</p>
+      <p class="big" id="sizeNum"></p>
+      <ul class="chips">
+        <li id="chipMap" hidden></li>
+        <li id="chipTotal" hidden></li>
+      </ul>
+    </div>
+    <p class="note" id="sizeNote">The game data is streamed from the server this page came from and kept in your browser's storage (up to 6 GB), so later starts load much faster.</p>
+    <p class="problem" id="problem" hidden></p>
+
+    <div class="actions">
+      <span class="glow"><button id="startBtn" class="start" type="button" disabled><span>Start</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square" aria-hidden="true"><path d="M3 12h16M13 5l7 7-7 7"/></svg></button></span>
+      <span class="hint" id="hint" hidden>or press <kbd>Enter</kbd></span>
+    </div>
+    <p class="fine">Nothing is downloaded until you press Start. Unofficial browser port; it needs your own copy of the game data on the server.</p>
+  </section>
+</main>
+
+<div id="wrap" hidden>
   <canvas id="canvas" width="1280" height="720" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
   <div id="audioHint" style="display:none;position:fixed;top:8px;left:8px;padding:4px 8px;background:#000a;color:#fc6;border:1px solid #fc6;font:12px monospace;pointer-events:none">&#128263; click or press a key to enable sound</div>
   <div id="log"></div>
 </div>
+
+<!-- emscripten's loader script: kept inert in a template and only added to the page by startGame() -->
+<template id="gameScript">{{{ SCRIPT }}}</template>
+
 <script>
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  // start screen
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  (function () {
+    const $ = (id) => document.getElementById(id);
+    const btn = $('startBtn');
+
+    window.startGame = function () {
+      if (window.__gameStarted) return;
+      window.__gameStarted = true;
+      $('wrap').hidden = false;                                 // the canvas must be laid out before the engine measures it
+      $('start').classList.add('leaving');
+      setTimeout(() => { $('start').hidden = true; }, 500);
+      const src = $('gameScript').content.querySelector('script').getAttribute('src');
+      const s = document.createElement('script');
+      s.src = src;
+      document.body.appendChild(s);                             // this is the first request for anything of the game
+    };
+
+    // Things the game cannot run without: say so instead of failing to a black screen.
+    const problems = [];
+    if (typeof SharedArrayBuffer === 'undefined' || !window.crossOriginIsolated) {
+      problems.push(window.isSecureContext
+        ? 'This page is not cross-origin isolated (the server must send the COOP/COEP headers; web/tools/serve.py does).'
+        : 'The browser treats this address as insecure, so it blocks features the game needs (SharedArrayBuffer, AudioWorklet). ' +
+          'Open it as http://localhost:<port> or over https. For other computers see "Other computers" in web/README.md.');
+    }
+    try {                                                       // a throwaway canvas: the real one is handed to the engine later
+      const gl = document.createElement('canvas').getContext('webgl2');
+      if (!gl) problems.push('WebGL 2 is not available in this browser.');
+      else { const lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext(); }
+    } catch (e) { problems.push('WebGL 2 is not available in this browser.'); }
+
+    if (problems.length) {
+      $('problem').textContent = problems.join(' ');
+      $('problem').hidden = false;
+    } else {
+      btn.disabled = false;
+      $('hint').hidden = false;
+      btn.focus();
+      document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !window.__gameStarted) { e.preventDefault(); window.startGame(); } });
+    }
+    btn.addEventListener('click', window.startGame);
+
+    // How much will be downloaded? (a few bytes of metadata from the server; none of the game itself)
+    const gb = (b) => Math.max(0.1, Math.round(b / 1e9 * 10) / 10);   // decimal GB, like the file sizes the OS shows
+    fetch('start-info.json', { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then((info) => {
+      if (!info || !info.dataBytes) return;
+      if (info.firstStartBytes) {
+        $('sizeNum').textContent = '≈ ' + gb(info.firstStartBytes) + ' GB';
+        $('sizeLabel').textContent = 'Download on first start · menus + one map';
+        if (info.extraMapBytes) { $('chipMap').innerHTML = '<b>+' + gb(info.extraMapBytes) + ' GB</b> per extra map'; $('chipMap').hidden = false; }
+        $('chipTotal').innerHTML = '<b>' + gb(info.dataBytes) + ' GB</b> on the server in total'; $('chipTotal').hidden = false;
+        $('sizeNote').textContent = 'Streamed from this server and kept in your browser (up to 6 GB), so later starts load much faster. Only what you play is downloaded.';
+      } else {
+        $('sizeNum').textContent = 'up to ' + gb(info.dataBytes) + ' GB';
+        $('sizeLabel').textContent = 'Game data on the server';
+        $('sizeNote').textContent = 'Only the parts you play are downloaded (the menus and one map are a fraction of that) and kept in your browser, so later starts load much faster.';
+      }
+      $('dl').hidden = false;
+    }).catch(() => {});
+
+    if (!problems.length && new URLSearchParams(location.search).has('autostart')) window.startGame();   // for development: skip the button
+  })();
+
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  // the game
+  // ---------------------------------------------------------------------------------------------------------------------------------------
   var logEl = document.getElementById('log');
   function addLog(s) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
   // ---- audio: the engine's mixer thread (web/audio/al_web.cpp) calls this once its device opens. The AudioContext starts
-  // suspended (autoplay policy) and is resumed by the first click/key press.
+  // suspended unless the page already had a user gesture (the Start button counts) and is resumed by the first click/key press.
   var kisakAudio = {};
   // ---- game data I/O: kvfs.cpp calls this once; io-worker.js then serves the engine's blocking range reads (persistent cache, parallel fetches).
   function kisakIoAttach(mem, ctlPtr) {
@@ -67,6 +249,5 @@
     locateFile: function (p) { return p; },
   };
 </script>
-{{{ SCRIPT }}}
 </body>
 </html>

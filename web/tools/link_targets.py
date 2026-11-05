@@ -12,7 +12,7 @@ def link_app(target, objs, root, web, build):
     p = subprocess.run(cmd, capture_output=True, text=True)
     open(os.path.join(out_dir, 'link.log'), 'w').write(p.stdout + p.stderr)
     import shutil
-    for aux in ('audio-worklet.js', 'io-worker.js'): shutil.copy(os.path.join(web, 'app', aux), out_dir)
+    for aux in ('audio-worklet.js', 'io-worker.js', 'hero.webp'): shutil.copy(os.path.join(web, 'app', aux), out_dir)
     jsf = os.path.join(out_dir, 'index.js')
     if os.path.exists(jsf):
         js = open(jsf).read().replace('captured an uncaught exception: ${ex}`', 'captured an uncaught exception: ${ex}\\n${ex && ex.stack}`')

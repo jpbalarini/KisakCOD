@@ -104,6 +104,63 @@ def validate_trace(raw):
         return None
 
 
+BOOT_PHASES = ("startup", "code_post_gfx_mp", "localized_code_post_gfx_mp", "common_mp", "localized_common_mp", "ui_mp")
+START_FACTOR = 1.25   # a first start downloads more than the traces list: merged gaps, read-ahead past the recorded reads
+                      # (measured: 527 MB downloaded vs 420 MB of traced reads for the menus + mp_crash)
+
+
+def read_trace(name):
+    try:
+        with open(trace_file(name), "rb") as f:
+            return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def traced_bytes(traces):
+    """Bytes covered by the union of the extents of these load traces (a range read by several phases counts once)."""
+    per = {}
+    for tr in traces:
+        for fi, s, e in tr["ext"]:
+            per.setdefault(tr["files"][fi], []).append((s, e))
+    total = 0
+    for spans in per.values():
+        spans.sort()
+        cs, ce = spans[0]
+        for s, e in spans[1:]:
+            if s <= ce:
+                ce = max(ce, e)
+            else:
+                total += ce - cs
+                cs, ce = s, e
+        total += ce - cs
+    return total
+
+
+def start_info():
+    """What the start screen shows: the size of all game data on the server, and an estimate of what a first start downloads (the menus
+    plus the largest recorded map), or None while the server has not recorded those load traces yet."""
+    sizes = json.loads(get_manifest())["files"]
+    info = {"dataBytes": sum(sizes.values()), "firstStartBytes": None, "extraMapBytes": None}
+    boot = [read_trace(n) for n in BOOT_PHASES]
+    maps = []
+    try:
+        names = [n[:-5] for n in os.listdir(ARGS.traces) if n.endswith(".json")]
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith("mp_") and not n.endswith("_load"):
+            tr = read_trace(n)
+            if tr:
+                maps.append(tr)
+    if maps and all(boot):
+        base = traced_bytes(boot)
+        biggest = max(traced_bytes(boot + [m]) for m in maps)
+        info["firstStartBytes"] = int(biggest * START_FACTOR)
+        info["extraMapBytes"] = int((biggest - base) * START_FACTOR)      # what one more map adds on top of the menus
+    return info
+
+
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     disable_nagle_algorithm = True    # TCP_NODELAY: with keep-alive, Nagle holds back the last partial segment of every response until the
@@ -137,6 +194,14 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if p.startswith("/data/"):
             return self.serve_data(p[len("/data/"):])
+        if p == "/start-info.json":
+            body = json.dumps(start_info()).encode() if ARGS.data else b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if p.startswith("/traces/"):
             name = p[len("/traces/"):]
             name = name[:-5] if name.endswith(".json") else name

@@ -47,6 +47,14 @@ python3 web/tools/survey.py                 # syntax-check every TU, grouped by 
 (The load test runs the engine under node with direct file access (`NODERAWFS`), so it can create stray files in the game data directory;
 the browser build never writes there.)
 
+**Start screen.** Opening the page is a full-screen key-art start screen (`app/hero.webp`, the game's own artwork: keep it out of anything you publish) with how much a first
+start downloads and a **Start** button (also Enter). Until you press it the page requests nothing of the game (no wasm, no workers, no data; only `hero.webp` and
+the tiny `/start-info.json`): `app/shell.html` keeps emcc's loader script inert in a `<template>` and adds it on click. The click is also the user
+gesture the browser wants before it lets audio play, so sound starts without a second click. The size comes from `serve.py` (`/start-info.json`: all game
+data on the server, and an estimate of "menus + the largest recorded map" from the load traces below, x1.25 for what the traces miss; until the
+traces exist it shows the total instead). If the browser cannot run the game (page not cross-origin isolated, e.g. plain `http://<lan ip>`; no WebGL 2)
+the screen says so and disables Start instead of showing a black canvas. `?autostart` skips the button (for development and scripts).
+
 Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser swallows Esc while the pointer is locked, so the
 loss of pointer lock is turned back into an Esc press). The pointer is only locked while the player controls the game: not while a menu, the
 console or a script menu has the cursor (those follow the *absolute* pointer position, which a locked pointer stops reporting, so the menu cursor
