@@ -14,6 +14,11 @@
 #include <qcommon/files.h>
 #include <io.h>
 
+#ifdef KISAK_WEB
+// The browser build's files live in kvfs (web/shim/kvfs.cpp), not in libc's file system: remove() would look in the wrong place.
+#define remove(path) kisak_remove(path)
+#endif
+
 const dvar_t *fs_remotePCDirectory;
 const dvar_t *fs_remotePCName;
 const dvar_t *fs_homepath;

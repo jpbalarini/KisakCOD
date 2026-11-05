@@ -150,6 +150,11 @@ BOOL SetFileAttributesA(LPCSTR, DWORD) { return TRUE; }
 BOOL DeleteFileA(LPCSTR name) { ensureInit(); return kvfs::unlink(normPath(name)); }
 BOOL RemoveDirectoryA(LPCSTR name) { ensureInit(); return kvfs::rmdir(normPath(name)); }
 BOOL CreateDirectoryA(LPCSTR name, LPSECURITY_ATTRIBUTES) { ensureInit(); return kvfs::mkdir(normPath(name)); }
+// CRT-style (0 = success, -1 = failure) versions for the engine's _mkdir / _rmdir / remove, redirected here by kisak_compat.h and, for remove(), by
+// the KISAK_WEB block in com_files.cpp / win_common.cpp.
+int kisak_mkdir(const char *path) { ensureInit(); return kvfs::mkdir(normPath(path)) ? 0 : -1; }
+int kisak_rmdir(const char *path) { ensureInit(); return kvfs::rmdir(normPath(path)) ? 0 : -1; }
+int kisak_remove(const char *path) { ensureInit(); return kvfs::unlink(normPath(path)) ? 0 : -1; }
 DWORD GetCurrentDirectoryA(DWORD n, LPSTR buf) { const char *r = kroot(); strncpy(buf, r, n); if (n) buf[n - 1] = 0; return (DWORD)strlen(buf); }
 DWORD GetModuleFileNameA(HMODULE, LPSTR buf, DWORD n) {
     // The engine derives its install path (where zone/, main/ and localization.txt live) from the exe path.

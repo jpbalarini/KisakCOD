@@ -74,6 +74,9 @@ static std::map<std::string, std::vector<Entry>> g_dirs;           // lower(rel 
 static std::mutex g_mutex;
 static std::map<std::string, std::shared_ptr<MemFile>> g_mem;      // lower(full path) -> file
 static std::set<std::string> g_memDirs;                            // lower(full path)
+static std::map<std::string, std::string> g_memOrig;              // lower(full path) -> the path as the engine spelled it (listings keep the capitals, as NTFS does)
+static std::string leafOf(const std::string &p) { size_t sl = p.rfind('/'); return sl == std::string::npos ? p : p.substr(sl + 1); }
+static std::string displayLeaf(const std::string &lowerPath) { auto it = g_memOrig.find(lowerPath); return leafOf(it != g_memOrig.end() ? it->second : lowerPath); }
 
 struct Handle {
     bool used = false;
@@ -81,6 +84,7 @@ struct Handle {
     std::string rel; uint64_t size = 0;      // remote
     int64_t pos = 0;
     bool writable = false, append = false;
+    bool persist = false; std::string persistRel;   // a file under players/: saved to the browser's storage when closed (see "profile persistence")
     // remote read state (see remoteRead): sequential-stream detection + a private buffer for streaming reads
     uint32_t fileId = 0;
     int streak = 0;                  // consecutive fetches that continued right where the previous one ended
@@ -151,6 +155,7 @@ EM_JS(int, kvfs_io_call, (int32_t *ctl, int slot, const char *path, double off, 
     Atomics.store(I, b + 3, Math.floor(off / 4294967296));
     Atomics.store(I, b + 4, len);
     Atomics.store(I, b + 5, dst);
+    Atomics.store(I, b + 7, 0);                     // op 0: range read
     Atomics.store(I, b, 1);
     Atomics.add(I, ctl >> 2, 1);
     Atomics.notify(I, ctl >> 2);
@@ -160,12 +165,93 @@ EM_JS(int, kvfs_io_call, (int32_t *ctl, int slot, const char *path, double off, 
     return r;
 });
 
-static int ioFetch(const std::string &rel, int64_t off, int len, void *dst)
+// This thread's request slot, or -1 if all are taken.
+static int ioSlot()
 {
     static thread_local int slot = -2;
     if (slot == -2) { int s = g_ioNextSlot.fetch_add(1); slot = s < kIoSlots ? s : -1; }
+    return slot;
+}
+
+static int ioFetch(const std::string &rel, int64_t off, int len, void *dst)
+{
+    int slot = ioSlot();
     if (slot < 0) return -3;
     return kvfs_io_call((int32_t *)g_ioCtl, slot, rel.c_str(), (double)off, len, dst);
+}
+
+// ---- profile persistence -----------------------------------------------------------------------------------------------------------
+// The engine's player profiles (config, stats/unlocks/custom classes, profile list, active profile) are files under <root>/players/ that live in
+// memory (g_mem). They are mirrored to the I/O worker, which keeps them in IndexedDB (see "profile persistence" in app/io-worker.js): loaded back
+// into g_mem by kvfs::init, and every close of a written file / unlink / mkdir / rmdir below players/ is sent as it happens.
+enum { kProfSize = 1, kProfData = 2, kProfPut = 3, kProfDel = 4, kProfMkdir = 5 };
+static bool g_profPersist = false;
+
+EM_JS(int, kvfs_prof_call, (int32_t *ctl, int slot, int op, const char *path, const void *data, int len), {
+    const I = HEAP32, b = (ctl >> 2) + 8 + slot * 8;
+    Atomics.store(I, b + 1, path);
+    Atomics.store(I, b + 4, len);
+    Atomics.store(I, b + 5, data);
+    Atomics.store(I, b + 7, op);
+    Atomics.store(I, b, 1);
+    Atomics.add(I, ctl >> 2, 1);
+    Atomics.notify(I, ctl >> 2);
+    while (Atomics.load(I, b) !== 2) Atomics.wait(I, b, Atomics.load(I, b), 1000);
+    const r = Atomics.load(I, b + 6);
+    Atomics.store(I, b, 0);
+    return r;
+});
+
+static int profCall(int op, const std::string &rel, const void *data, int len)
+{
+    if (!g_profPersist) return -3;
+    int slot = ioSlot();
+    if (slot < 0) return -3;
+    return kvfs_prof_call((int32_t *)g_ioCtl, slot, op, rel.c_str(), data, len);
+}
+
+// Is `path` (any case) <root>/players or below it? Then *rel = the path relative to the root, as spelled.
+static bool isPersistPath(const std::string &path, std::string *rel)
+{
+    const std::string lp = lower(path), pre = g_root + "/players";
+    if (lp.size() < pre.size() || lp.compare(0, pre.size(), pre) != 0) return false;
+    if (lp.size() > pre.size() && lp[pre.size()] != '/') return false;
+    *rel = path.substr(g_root.size() + 1);
+    return true;
+}
+
+// Bring back what an earlier session saved (before the engine looks for profiles).
+static void profileLoad()
+{
+    int n = profCall(kProfSize, "", nullptr, 0);
+    if (n <= 0) return;
+    std::vector<uint8_t> blob((size_t)n);
+    int got = profCall(kProfData, "", blob.data(), n);
+    if (got != n) { fprintf(stderr, "[kvfs] the saved profile could not be read (%d)\n", got); return; }
+    auto rd32 = [&](size_t p) { uint32_t v; memcpy(&v, &blob[p], 4); return v; };
+    size_t p = 0, files = 0, dirs = 0;
+    if ((size_t)n < 4) return;
+    uint32_t count = rd32(p); p += 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (p + 5 > (size_t)n) break;
+        bool isDir = blob[p++] != 0;
+        uint32_t pl = rd32(p); p += 4;
+        if (p + pl + 4 > (size_t)n) break;
+        std::string rel((const char *)&blob[p], pl); p += pl;
+        uint32_t dl = rd32(p); p += 4;
+        if (p + dl > (size_t)n) break;
+        std::string full = g_rootExact + "/" + rel, key = lower(full), chk;
+        if (!isPersistPath(full, &chk)) { p += dl; continue; }          // only ever restore below players/
+        g_memOrig[key] = full;
+        if (isDir) { g_memDirs.insert(key); ++dirs; }
+        else {
+            auto mf = std::make_shared<MemFile>();
+            mf->data.assign(blob.begin() + p, blob.begin() + p + dl);
+            g_mem[key] = mf; ++files;
+        }
+        p += dl;
+    }
+    fprintf(stderr, "[kvfs] saved profile restored: %zu files, %zu directories\n", files, dirs);
 }
 
 // ---- request statistics (KISAK_FSSTATS=1 / `--fsstats`): what the engine reads and what it costs ----------------------------------
@@ -287,6 +373,9 @@ void init(const char *installRoot)
     int io = ioStart();
     g_ioState = (io == 1 || io == 3) ? 1 : 2;
     fprintf(stderr, "[kvfs] data I/O: %s\n", io == 1 ? "worker with persistent cache" : io == 3 ? "worker, network only (cache unavailable or in use by another tab)" : "plain XHR (worker unavailable)");
+    g_profPersist = g_ioState == 1;
+    if (g_profPersist) profileLoad();
+    else fprintf(stderr, "[kvfs] profiles are not saved (the I/O worker is unavailable)\n");
 }
 
 // returns true if `path` is below the install root; sets rel (relative path, original case as given)
@@ -344,18 +433,33 @@ int open(const std::string &path, int of)
         if ((of & O_EXCL) && mit != g_mem.end()) { errno = EEXIST; return -1; }
         mf = std::make_shared<MemFile>();
         g_mem[lp] = mf;
+        g_memOrig[lp] = path;
     }
     int h = allocHandle(); Handle *hd = handleOf(h); hd->mem = mf; hd->writable = true; hd->append = (of & O_APPEND) != 0;
+    hd->persist = g_profPersist && isPersistPath(path, &hd->persistRel);
     return h;
 }
 
 int close(int h)
 {
     if (!g_browser || h < kHandleBase) return ::close(h);
-    std::lock_guard<std::mutex> g(g_mutex);
-    Handle *hd = handleOf(h);
-    if (!hd) return -1;
-    *hd = Handle();
+    std::string saveRel; std::vector<uint8_t> snapshot; bool save = false;
+    {
+        std::lock_guard<std::mutex> g(g_mutex);
+        Handle *hd = handleOf(h);
+        if (!hd) return -1;
+        if (hd->writable && hd->persist && hd->mem) {      // a profile file was written: remember what it contains now
+            save = true; saveRel = hd->persistRel;
+            std::lock_guard<std::mutex> gm(hd->mem->m);
+            snapshot = hd->mem->data;
+        }
+        *hd = Handle();
+    }
+    if (save) {                                            // (outside the locks: this waits for the I/O worker)
+        int r = profCall(kProfPut, saveRel, snapshot.data(), (int)snapshot.size());
+        if (r < 0) fprintf(stderr, "[kvfs] could not save %s (%d)\n", saveRel.c_str(), r);
+        else if (r == 0) fprintf(stderr, "[kvfs] saved %s (%zu bytes)\n", saveRel.c_str(), snapshot.size());
+    }
     return 0;
 }
 
@@ -591,7 +695,7 @@ bool listdir(const std::string &dir, std::vector<Entry> *out)
         size_t sl = kv.first.rfind('/');
         if (sl == std::string::npos) continue;
         if (kv.first.substr(0, sl) == ld) {
-            std::string nm = kv.first.substr(sl + 1);
+            std::string nm = displayLeaf(kv.first);
             bool dup = false;
             for (auto &e : *out) if (strcasecmp(e.name.c_str(), nm.c_str()) == 0) { dup = true; break; }
             if (!dup) out->push_back(Entry{nm, false, kv.second->data.size()});
@@ -601,7 +705,7 @@ bool listdir(const std::string &dir, std::vector<Entry> *out)
     for (const std::string &d : g_memDirs) {          // in-memory subdirectories
         size_t sl = d.rfind('/');
         if (sl == std::string::npos || d.substr(0, sl) != ld) continue;
-        std::string nm = d.substr(sl + 1);
+        std::string nm = displayLeaf(d);
         bool dup = false;
         for (auto &e : *out) if (strcasecmp(e.name.c_str(), nm.c_str()) == 0) { dup = true; break; }
         if (!dup) out->push_back(Entry{nm, true, 0});
@@ -617,21 +721,34 @@ bool listdir(const std::string &dir, std::vector<Entry> *out)
 bool unlink(const std::string &path)
 {
     if (!g_browser) return ::unlink(path.c_str()) == 0;
-    std::lock_guard<std::mutex> g(g_mutex);
-    return g_mem.erase(lower(path)) > 0;
+    std::string lp = lower(path), rel;
+    bool ok;
+    { std::lock_guard<std::mutex> g(g_mutex); ok = g_mem.erase(lp) > 0; if (ok) g_memOrig.erase(lp); }
+    if (ok && g_profPersist && isPersistPath(path, &rel)) profCall(kProfDel, rel, nullptr, 0);
+    return ok;
 }
-bool mkdir(const std::string &path)
+// The engine names directories both ways ("...\\profiles\\zed" when creating, "...\\profiles\\zed\\" when deleting a tree): a directory is recorded without a trailing slash.
+static std::string noTrailingSlash(std::string p) { while (p.size() > 1 && p.back() == '/') p.pop_back(); return p; }
+
+bool mkdir(const std::string &path_)
 {
-    if (!g_browser) return ::mkdir(path.c_str(), 0777) == 0;
-    std::lock_guard<std::mutex> g(g_mutex);
-    g_memDirs.insert(lower(path));
+    if (!g_browser) return ::mkdir(path_.c_str(), 0777) == 0;
+    const std::string path = noTrailingSlash(path_);
+    std::string lp = lower(path), rel;
+    bool isNew;
+    { std::lock_guard<std::mutex> g(g_mutex); isNew = g_memDirs.insert(lp).second; if (isNew) g_memOrig[lp] = path; }
+    if (isNew && g_profPersist && isPersistPath(path, &rel)) profCall(kProfMkdir, rel, nullptr, 0);
     return true;
 }
-bool rmdir(const std::string &path)
+bool rmdir(const std::string &path_)
 {
-    if (!g_browser) return ::rmdir(path.c_str()) == 0;
-    std::lock_guard<std::mutex> g(g_mutex);
-    return g_memDirs.erase(lower(path)) > 0;
+    if (!g_browser) return ::rmdir(path_.c_str()) == 0;
+    const std::string path = noTrailingSlash(path_);
+    std::string lp = lower(path), rel;
+    bool ok;
+    { std::lock_guard<std::mutex> g(g_mutex); ok = g_memDirs.erase(lp) > 0; if (ok) g_memOrig.erase(lp); }
+    if (ok && g_profPersist && isPersistPath(path, &rel)) profCall(kProfDel, rel, nullptr, 0);
+    return ok;
 }
 
 } // namespace kvfs

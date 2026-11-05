@@ -29,7 +29,7 @@ the engine sources under `src/` carry only small patches (see `git diff`).
 - **Next:** make it public (relay on a server, signed identities, a dedicated server build instead of a hosting tab), persistence of
   profile/config, performance of menus. Known rough edges: no reverb/EQ (EFX is stubbed), no HRTF/3D beyond left-right pan, menu frames
   are slow (~12 fps, blur passes), the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour
-  fallback, occlusion queries report 0, Bink is a stub, profile/config files are memory-only (lost on reload), no gamepad, no voice chat.
+  fallback, occlusion queries report 0, Bink is a stub, profiles are saved per browser only (see Profiles), no gamepad, no voice chat.
 
 ## Build & run (needs emscripten, python3)
 ```bash
@@ -63,10 +63,32 @@ loss of pointer lock is turned back into an Esc press). The pointer is only lock
 console or a script menu has the cursor (those follow the *absolute* pointer position, which a locked pointer stops reporting, so the menu cursor
 froze: clicking a team button right after joining used to lock it, because the client already counts as "in game" then). It is released when a menu
 opens and re-requested when it closes (the browser performs that at the next click or key press). `--no-profile` shows the profile screen instead of seeding one.
+The UI text fields and the console delete with the Backspace *character* (Windows sends it as `WM_CHAR` 8 and ignores the key event), so `platform/input_web.cpp`
+sends that character on Backspace too; before, Backspace did nothing in the profile-name box.
 URL options: `?args=--nosound` (skip the audio mixer), `?args=--gldebug` (check GL errors after every draw), `?args=--trace-fs`, and any engine command line, e.g.
 `?args=%2Bset%20developer%200`. The dev server (`web/tools/serve.py`) adds the COOP/COEP headers that wasm threads need
 and serves the install dir read-only under `/data/` (never copied or uploaded).
 
+
+## Profiles (saved in the browser)
+The engine's player profiles are files under `<install root>/players/`: `profiles/active.txt` (the profile in use), and per profile `config_mp.cfg`
+(settings, keybinds, sensitivity) and `mpdata` (rank, unlocks, custom classes, challenges). `shim/kvfs.cpp` keeps engine-written files in memory and now
+also mirrors everything under `players/` to the I/O worker (`app/io-worker.js`), which stores it in **IndexedDB** (database `kisak-profile`, store `files`,
+records `{path (lower case key), orig (with the capitals), dir, data, mtime}`). At start-up `kvfs::init` asks the worker for the saved files before the
+engine looks for profiles, so a reload (or a new visit) comes back with the same profile list, settings and stats; the seeded `Player` profile is only
+created on a first run. Each save happens when the engine closes a written file (or deletes / creates a directory), so a tab closed mid-write can lose
+that one write. Every save logs `[kvfs] saved players/...` in the page log.
+- **Several profiles:** the game's own Select Profile / Create / Delete menus work and are saved. With more than one profile the game asks which one to
+  use at start-up (CoD4's own behaviour). Names keep their capitals (the in-memory listing used to lower-case everything).
+- **Per browser, per origin:** nothing is shared between browsers, devices or `localhost` vs `127.0.0.1`; clearing site data deletes it. Two tabs of one
+  browser each load the profile at their start and the last one to save wins. Use **Export / Import** on the start screen to back a profile up or move it:
+  Export downloads `cod4-web-profile-<date>.json` (all saved files, base64); Import merges such a file into the saved profiles (same paths are
+  overwritten) and only accepts plain paths below `players/`; it takes effect the next time you press Start.
+- **`?args=--nopersist`** neither restores nor saves (the profile then only lives in memory, as before); handy for tests.
+- **Engine fixes this needed:** the engine creates and removes profile directories with `_mkdir` / `_rmdir` / `remove()`, which in the browser went to
+  Emscripten's own file system instead of kvfs, so a "created" profile never really existed (it only appeared in the menu) and deleting one always failed.
+  `kisak_compat.h` now routes `_mkdir` / `_rmdir` to kvfs (`kisak_mkdir` / `kisak_rmdir` in `win32_shim.cpp`), and `com_files.cpp` / `win_common.cpp` get a
+  `#ifdef KISAK_WEB` block that does the same for `remove()`. kvfs ignores a trailing slash on directory names.
 
 ## Multiplayer
 `web/run.sh` (i.e. `tools/serve.py`) also starts the relay on `ws://localhost:8081/` (`--relay-port 0` disables it; `tools/relay.py` runs it standalone).

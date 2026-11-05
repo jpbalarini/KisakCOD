@@ -29,8 +29,9 @@ void Sys_FindInfo();
 
 static int g_frames = 0;
 
-// Files the engine writes live in memory (kvfs), so a player profile would have to be created in the UI on every page load.
-// Pre-seed one (players/profiles/active.txt + its directory) so the game starts straight into the main menu.
+// Files the engine writes live in memory (kvfs); the ones under players/ (the profiles) are also saved in the browser and restored at start-up.
+// On a first run there is no profile yet: seed one (players/profiles/active.txt + its directory) so the game starts straight into the main menu
+// instead of the "create a profile" screen. (These writes are saved like any other.)
 static void SeedDefaultProfile()
 {
     const char *name = "Player";
@@ -105,7 +106,10 @@ int main(int argc, char **argv)
     Sys_Milliseconds();
     Profile_Init();
     Profile_InitContext(0);
-    if (autoProfile) SeedDefaultProfile();
+    // A profile saved by an earlier session was restored by kvfs::init (active.txt names the profile in use); only a first run creates "Player".
+    bool savedProfile = false;
+    { bool isDir = false; int64_t size = 0; savedProfile = kvfs::statPath("/cod4/players/profiles/active.txt", &isDir, &size) && !isDir && size > 0; }
+    if (autoProfile && !savedProfile) SeedDefaultProfile();
     Steam_Init();   // browser identity (platform/steam_web.cpp): the connect handshake sends a "Steam" ticket
     fprintf(stderr, "[web] Com_Init...\n");
     Com_Init(sys_cmdline);

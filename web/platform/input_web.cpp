@@ -80,6 +80,9 @@ static bool OnKey(int type, const EmscriptenKeyboardEvent *e, void *)
         unsigned char ch = (unsigned char)e->key[0];
         if (ch >= 32 && ch < 127) Sys_QueEvent(0, SE_CHAR, ch, 0, 0, 0);
     }
+    // Windows delivers Backspace as a character (WM_CHAR, 8) as well, and that is what the UI text fields and the console delete with (they ignore the
+    // key event). Held down, keydown repeats, like WM_CHAR does.
+    if (down && !strcmp(e->code, "Backspace") && !e->ctrlKey && !e->metaKey && !e->altKey) Sys_QueEvent(0, SE_CHAR, 8, 0, 0, 0);
     return key != 0 || (down && e->key[0] && !e->key[1]);
 }
 

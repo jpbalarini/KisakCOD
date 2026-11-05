@@ -104,8 +104,14 @@ typedef long long __time64_t;
 static inline __time64_t _time64(__time64_t* t) { time_t r = time(nullptr); if (t) *t = r; return r; }
 static inline char* _ctime64(const __time64_t* t) { time_t tt = (time_t)*t; return ctime(&tt); }
 static inline struct tm* _localtime64(const __time64_t* t) { time_t tt = (time_t)*t; return localtime(&tt); }
-#define _mkdir(p) mkdir((p), 0777)
-#define _rmdir rmdir
+// The engine's mkdir / rmdir / remove (profile directories, deleting profiles) must act on kvfs's files, not libc's: see win32_shim.cpp.
+extern "C" {
+int kisak_mkdir(const char *path);
+int kisak_rmdir(const char *path);
+int kisak_remove(const char *path);
+}
+#define _mkdir(p) kisak_mkdir(p)
+#define _rmdir(p) kisak_rmdir(p)
 #define _putenv putenv
 typedef int errno_t;
 static inline errno_t fopen_s(FILE** f, const char* name, const char* mode) { *f = fopen(name, mode); return *f ? 0 : errno; }

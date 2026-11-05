@@ -35,7 +35,7 @@
                    background: linear-gradient(transparent, var(--accent), transparent); opacity: .55; }
   .panel > * { opacity: 0; transform: translateY(14px); animation: rise .75s cubic-bezier(.2, .7, .2, 1) forwards; animation-delay: calc(var(--i, 0) * 90ms + 120ms); }
   .panel > :nth-child(1) { --i: 0; } .panel > :nth-child(2) { --i: 1; } .panel > :nth-child(3) { --i: 2; } .panel > :nth-child(4) { --i: 3; }
-  .panel > :nth-child(5) { --i: 4; } .panel > :nth-child(6) { --i: 5; } .panel > :nth-child(7) { --i: 6; }
+  .panel > :nth-child(5) { --i: 4; } .panel > :nth-child(6) { --i: 5; } .panel > :nth-child(7) { --i: 6; } .panel > :nth-child(8) { --i: 7; } .panel > :nth-child(9) { --i: 8; }
   @keyframes rise { to { opacity: 1; transform: none; } }
 
   .eyebrow { display: flex; align-items: center; gap: 14px; margin: 0 0 14px; color: var(--accent); font: 600 12.5px/1 var(--body); letter-spacing: .32em; text-transform: uppercase; }
@@ -67,6 +67,15 @@
   .glow { filter: drop-shadow(0 0 22px rgba(143, 211, 182, .35)); }
   .hint { color: var(--muted); font-size: 13px; }
   kbd { display: inline-block; padding: 3px 8px; border: 1px solid var(--line); border-radius: 3px; color: var(--fg); font: 600 11.5px/1 var(--body); letter-spacing: .14em; text-transform: uppercase; }
+  .profile { margin: 26px 0 0; max-width: 58ch; color: var(--muted); font-size: 13px; }
+  .profile b { color: var(--fg); font-weight: 600; }
+  .link { appearance: none; background: none; border: 0; padding: 0; margin: 0 0 0 12px; color: var(--accent); font: inherit; letter-spacing: .04em;
+          text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+  .link:hover:not(:disabled) { color: var(--accent-hi); }
+  .link:disabled { color: #56635b; text-decoration: none; cursor: default; }
+  .link:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+  .profile-msg { margin: 8px 0 0; max-width: 58ch; color: var(--accent); font-size: 13px; }
+  .profile-msg.err { color: var(--warn); }
   .fine { margin: 28px 0 0; max-width: 54ch; color: #6f7a71; font-size: 12px; }
 
   @media (max-width: 760px) {
@@ -117,6 +126,11 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square" aria-hidden="true"><path d="M3 12h16M13 5l7 7-7 7"/></svg></button></span>
       <span class="hint" id="hint" hidden>or press <kbd>Enter</kbd></span>
     </div>
+    <p class="profile" id="profileLine" hidden>
+      <span id="profileText"></span><button type="button" class="link" id="exportBtn" disabled>Export</button><button type="button" class="link" id="importBtn">Import</button>
+      <input type="file" id="importFile" accept=".json,application/json" hidden>
+    </p>
+    <p class="profile-msg" id="profileMsg" role="status" hidden></p>
     <p class="fine">Nothing is downloaded until you press Start. Unofficial browser port; it needs your own copy of the game data on the server.</p>
   </section>
 </main>
@@ -193,6 +207,81 @@
       $('dl').hidden = false;
     }).catch(() => {});
 
+    // ---- saved profiles: the engine saves its player profiles in IndexedDB (database 'kisak-profile', see io-worker.js); list them here and offer
+    // Export / Import as a file. Paths in the store are relative to the install root and lower-case ('players/profiles/player/config_mp.cfg').
+    const PROF_DB = 'kisak-profile', PROF_STORE = 'files';
+    const openDb = () => new Promise((res, rej) => {
+      const r = indexedDB.open(PROF_DB, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore(PROF_STORE, { keyPath: 'path' });
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    const allRecords = async () => { const db = await openDb(); return new Promise((res, rej) => { const rq = db.transaction(PROF_STORE).objectStore(PROF_STORE).getAll(); rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); }); };
+    const putRecords = async (recs) => { const db = await openDb(); return new Promise((res, rej) => { const tx = db.transaction(PROF_STORE, 'readwrite'); const st = tx.objectStore(PROF_STORE); recs.forEach((r) => st.put(r)); tx.oncomplete = () => res(); tx.onerror = tx.onabort = () => rej(tx.error); }); };
+    const b64 = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+    const esc = (t) => t.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const msg = (text, err) => { const m = $('profileMsg'); m.textContent = text; m.classList.toggle('err', !!err); m.hidden = !text; };
+
+    async function showProfiles() {
+      const recs = await allRecords();
+      const names = new Set(), act = recs.find((r) => r.path === 'players/profiles/active.txt');
+      for (const r of recs) { const m = /^players\/profiles\/([^/]+)(?:\/|$)/.exec(r.orig || r.path); if (m && m[1].toLowerCase() !== 'active.txt') names.add(m[1]); }
+      const active = act && act.data ? new TextDecoder().decode(new Uint8Array(act.data)).trim().toLowerCase() : '';
+      const list = [...names].sort((a, b) => (b.toLowerCase() === active) - (a.toLowerCase() === active) || a.localeCompare(b))
+        .map((n) => (n.toLowerCase() === active ? '<b>' + esc(n) + '</b> (in use)' : esc(n)));
+      $('profileText').innerHTML = list.length ? 'Saved in this browser: ' + list.join(', ') : 'No saved profile yet; one is created when you play.';
+      $('exportBtn').disabled = !recs.length;
+      $('profileLine').hidden = false;
+    }
+
+    async function exportProfiles() {
+      const recs = await allRecords();
+      const files = recs.map((r) => r.dir ? { path: r.path, orig: r.orig, dir: true } : { path: r.path, orig: r.orig, data: b64(new Uint8Array(r.data)) });
+      const doc = { format: 'kisakcod-profile', version: 1, exported: new Date().toISOString(), files };
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 1)], { type: 'application/json' }));
+      a.download = 'cod4-web-profile-' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      msg('Exported ' + files.filter((f) => !f.dir).length + ' files.');
+    }
+
+    // Merges the file into the saved profiles (same paths are overwritten). Only plain paths below players/ are accepted.
+    async function importProfiles(file) {
+      const doc = JSON.parse(await file.text());
+      if (!doc || doc.format !== 'kisakcod-profile' || doc.version !== 1 || !Array.isArray(doc.files)) throw new Error('this is not a profile file exported from this game');
+      if (doc.files.length > 500) throw new Error('the file lists too many files');
+      const recs = []; let total = 0;
+      for (const f of doc.files) {
+        const path = String((f && f.path) || '').toLowerCase();
+        if (!/^players(\/[a-z0-9_. \-]+)*$/.test(path) || path.split('/').some((seg) => /^\.+$/.test(seg))) throw new Error('unexpected path "' + path.slice(0, 60) + '" in the file');
+        const orig = typeof f.orig === 'string' && f.orig.toLowerCase() === path && /^players(\/[A-Za-z0-9_. \-]+)*$/.test(f.orig) ? f.orig : path;   // the capitals, if they check out
+        if (f.dir) { recs.push({ path, orig, dir: true, mtime: Date.now() }); continue; }
+        const bin = atob(String(f.data || ''));
+        total += bin.length;
+        if (total > 8e6) throw new Error('the file is too large to be a profile');
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        recs.push({ path, orig, dir: false, data: u8.buffer, mtime: Date.now() });
+      }
+      if (!recs.length) throw new Error('the file contains no profile data');
+      await putRecords(recs);
+      return recs.filter((r) => !r.dir).length;
+    }
+
+    if (window.indexedDB) {
+      showProfiles().catch(() => {});
+      $('exportBtn').addEventListener('click', () => exportProfiles().catch((e) => msg('Export failed: ' + e.message, true)));
+      $('importBtn').addEventListener('click', () => $('importFile').click());
+      $('importFile').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        e.target.value = '';
+        if (!file) return;
+        try { const n = await importProfiles(file); msg('Imported ' + n + ' files. They are used the next time you press Start.'); await showProfiles(); }
+        catch (err) { msg('Import failed: ' + err.message, true); }
+      });
+    }
+
     if (!problems.length && new URLSearchParams(location.search).has('autostart')) window.startGame();   // for development: skip the button
   })();
 
@@ -214,7 +303,7 @@
   // ---- game data I/O: kvfs.cpp calls this once; io-worker.js then serves the engine's blocking range reads (persistent cache, parallel fetches).
   function kisakIoAttach(mem, ctlPtr) {
     const args = (new URLSearchParams(location.search).get('args') || '').split(' ');
-    const msg = { memory: mem, ctl: ctlPtr, base: location.origin, nocache: args.includes('--nocache'), clear: args.includes('--clearcache'), learn: args.includes('--learn') };
+    const msg = { memory: mem, ctl: ctlPtr, base: location.origin, nocache: args.includes('--nocache'), clear: args.includes('--clearcache'), learn: args.includes('--learn'), nopersist: args.includes('--nopersist') };
     try {
       const w = new Worker('io-worker.js');
       w.onerror = (e) => { addLog('[io] worker error: ' + e.message); };

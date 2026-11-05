@@ -390,9 +390,91 @@ function noteAccess(f, off, n) {
   getRange(f, gaps[0][0], Math.min(b, gaps[0][1])).catch(() => {});
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// profile persistence. The engine writes its player profiles (config, stats, unlocks, custom classes, the list of profiles and the active one)
+// as files under <install root>/players/, which kvfs.cpp keeps in memory. kvfs mirrors every change to them here with request types 3-5, and asks for
+// everything saved with request types 1-2 at start-up, so a profile survives a page reload. Stored in IndexedDB (not the OPFS cache: those handles are
+// exclusive to one tab, IndexedDB is not): database 'kisak-profile', store 'files', records {path, dir, data, mtime} with paths relative to the install
+// root: `path` is the lower-case key ('players/profiles/alice/config_mp.cfg'), `orig` the same path with the capitals the engine used. app/shell.html
+// reads and writes the same store for Export / Import.
+//   request word 7 (op): 0 = range read (above)   1 = size of the saved profile blob   2 = fetch it   3 = save a file   4 = delete   5 = make a directory
+// The blob: u32 count, then per record: u8 isDir, u32 pathLen, path (utf-8), u32 dataLen, data (all little-endian).
+// ---------------------------------------------------------------------------------------------------------------------------------------
+const PROF_DB = 'kisak-profile', PROF_STORE = 'files';
+let profDb = null, profChain = Promise.resolve(), profBlob = null, nopersist = false;
+
+function profOpen() {
+  if (!profDb) profDb = new Promise((res, rej) => {
+    const r = indexedDB.open(PROF_DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(PROF_STORE, { keyPath: 'path' });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return profDb;
+}
+function profTx(mode, fn) {
+  return profOpen().then((db) => new Promise((res, rej) => {
+    const tx = db.transaction(PROF_STORE, mode);
+    const rq = fn(tx.objectStore(PROF_STORE));
+    tx.oncomplete = () => res(rq && rq.result);
+    tx.onerror = tx.onabort = () => rej(tx.error);
+  }));
+}
+function profQueue(fn) {                           // writes happen in the order the engine made them
+  profChain = profChain.then(fn).catch((e) => console.warn('[io] saving the profile failed:', e));
+}
+
+async function profBuildBlob() {
+  const recs = await profTx('readonly', (s) => s.getAll());
+  const enc = new TextEncoder();
+  const items = recs.map((r) => ({ dir: !!r.dir, path: enc.encode(r.orig || r.path), data: r.dir ? new Uint8Array(0) : new Uint8Array(r.data) }));
+  let total = 4;
+  for (const it of items) total += 1 + 4 + it.path.length + 4 + it.data.length;
+  const out = new Uint8Array(total), dv = new DataView(out.buffer);
+  let p = 0;
+  dv.setUint32(p, items.length, true); p += 4;
+  for (const it of items) {
+    out[p++] = it.dir ? 1 : 0;
+    dv.setUint32(p, it.path.length, true); p += 4; out.set(it.path, p); p += it.path.length;
+    dv.setUint32(p, it.data.length, true); p += 4; out.set(it.data, p); p += it.data.length;
+  }
+  return out;
+}
+
+async function serveProfile(slot, op) {
+  const b = (ctl >> 2) + SLOT0 + slot * SLOT_WORDS;
+  let I = view();
+  const ptr = I[b + 1], len = I[b + 4], dst = I[b + 5] >>> 0;
+  let result = 0;
+  try {
+    if (nopersist) result = op >= 3 ? 1 : 0;       // switched off (?args=--nopersist): requests are accepted and ignored (1 = "not stored")
+    else {
+      if (op === 1) { profBlob = await profBuildBlob(); result = profBlob.length > 4 ? profBlob.length : 0; if (!result) profBlob = null; }
+      else if (op === 2) { if (profBlob) { new Uint8Array(mem.buffer, dst, profBlob.length).set(profBlob); result = profBlob.length; profBlob = null; } }
+      else {
+        const orig = readCString(ptr), path = orig.toLowerCase();               // key: lower case; `orig` keeps the capitals ('players/profiles/Alice/...')
+        if (op === 3) {
+          const data = new Uint8Array(mem.buffer, dst, len).slice().buffer;     // copy now: the engine's buffer is only valid until this request completes
+          profQueue(() => profTx('readwrite', (s) => s.put({ path, orig, dir: false, data, mtime: Date.now() })));
+        } else if (op === 4) profQueue(() => profTx('readwrite', (s) => s.delete(path)));
+        else if (op === 5) profQueue(() => profTx('readwrite', (s) => s.put({ path, orig, dir: true, mtime: Date.now() })));
+      }
+    }
+  } catch (e) {
+    console.warn('[io] profile request failed:', e);
+    result = -2;
+  }
+  I = view();
+  Atomics.store(I, b + 6, result);
+  Atomics.store(I, b, 2);
+  Atomics.notify(I, b);
+}
+
 async function serve(slot) {
   const b = (ctl >> 2) + SLOT0 + slot * SLOT_WORDS;
   let I = view();
+  const op = I[b + 7];
+  if (op) return serveProfile(slot, op);
   const ptr = I[b + 1], off = (I[b + 2] >>> 0) + (I[b + 3] >>> 0) * 4294967296, len = I[b + 4], dst = I[b + 5] >>> 0;
   let result = -1;
   try {
@@ -440,6 +522,7 @@ onmessage = async (ev) => {
   ctl = m.ctl;
   base = m.base;
   learnAll = !!m.learn;
+  nopersist = !!m.nopersist;
   const setReady = (v) => { const I = view(); Atomics.store(I, (ctl >> 2) + 1, v); Atomics.notify(I, (ctl >> 2) + 1); };
   try {
     const man = await (await fetch(`${base}/data-manifest.json`)).json();

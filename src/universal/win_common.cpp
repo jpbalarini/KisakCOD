@@ -12,6 +12,11 @@
 #include "com_memory.h"
 #include "profile.h"
 
+#ifdef KISAK_WEB
+// The browser build's files live in kvfs (web/shim/kvfs.cpp), not in libc's file system: remove() would look in the wrong place.
+#define remove(path) kisak_remove(path)
+#endif
+
 #if defined(_WIN32) || defined(KISAK_WEB)
 _RTL_CRITICAL_SECTION s_criticalSections[CRITSECT_COUNT];
 #else
