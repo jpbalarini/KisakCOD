@@ -57,6 +57,19 @@ the screen says so and disables Start instead of showing a black canvas. `?autos
 `platform/sys_web.cpp` stops the frame loop and calls `kisakGameExited()` in `app/shell.html`). Before, `exit(0)` left the browser's frame loop running
 against the freed UI and the log filled with `Could not find menu 'main'` forever.
 
+**Fullscreen.** The start screen has a *Fullscreen* option next to Start (remembered, on by default): Start then enters the browser's real fullscreen (Fullscreen API on `#wrap`,
+so the browser's toolbar and tabs disappear, unlike the browser's own "enter full screen" menu item, which keeps them on a Mac). In the game: **F11** or **Alt+Enter**
+(Option+Enter on a Mac) toggles it, and so does the button at the top right that shows while the mouse moves. Esc is locked to the page while fullscreen (keyboard
+lock, Chrome/Edge), so it still opens the in-game menu and leaving fullscreen takes a long press of Esc; elsewhere a single Esc leaves it. The page has no log panel any
+more (`?log` shows it under the game; the text is always in `#log`); while the engine starts, its latest log line shows at the bottom left.
+The picture has no black bars: `app/shell.html` sizes the canvas to the largest rectangle of its shape that fits the *stage* (the whole window / screen) and reports the
+stage's size to the engine through shared memory (`kisakViewAttach`, and `--view=WxH` for the very first renderer). `platform/view_web.cpp` makes `R_SetWndParms`
+(`kisak_fit_display`, a `KISAK_WEB` patch in `src/gfx_d3d/r_init.cpp`) reshape the resolution `r_mode` asks for to the stage's aspect ratio, **keeping the pixel count** (Options >
+Video > Resolution stays the quality setting; e.g. 1024x768 -> 1118x702 on a 16:10 screen; aspect clamped to 4:3..21:9; an explicit `r_customMode` wins). When the stage's
+shape changes later (fullscreen on/off, resizing) the engine runs `vid_restart` by itself, **only from the main menu**: the engine refuses it while this tab hosts a game
+("Listen server cannot video restart"), and in a match it would reload the map's assets. Elsewhere the canvas is letterboxed to the old shape until the next menu visit.
+`web/platform/view_web.cpp` logs `[view]` lines. Not tested in a real fullscreen Chrome window (the built-in pane refuses fullscreen): the Start screen falls back to windowed after 2 s there.
+
 Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser swallows Esc while the pointer is locked, so the
 loss of pointer lock is turned back into an Esc press). The pointer is only locked while the player controls the game: not while a menu, the
 console or a script menu has the cursor (those follow the *absolute* pointer position, which a locked pointer stops reporting, so the menu cursor

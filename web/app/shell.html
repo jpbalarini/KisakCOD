@@ -93,10 +93,34 @@
     #start, .start, .start svg { transition: none; }
   }
 
+  .fsopt { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; letter-spacing: .04em; cursor: pointer; user-select: none; }
+  .fsopt:hover { color: var(--fg); }
+  .fsopt input { appearance: none; display: grid; place-items: center; width: 18px; height: 18px; margin: 0; border: 1px solid var(--line); background: rgba(5, 8, 6, .5); cursor: pointer; }
+  .fsopt input::after { content: ""; width: 8px; height: 8px; background: var(--accent); transform: scale(0); transition: transform .12s ease; }
+  .fsopt input:checked::after { transform: scale(1); }
+  .fsopt input:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+
   /* ================= the game ================= */
-  #wrap { display: flex; flex-direction: column; height: 100%; font: 13px monospace; color: #ccc; background: #111; }
-  canvas { display: block; margin: 0 auto; background: #000; max-width: 100%; cursor: none; outline: none; }
-  #log { flex: 1; overflow: auto; white-space: pre-wrap; padding: 6px; border-top: 1px solid #333; min-height: 80px; }
+  #wrap { display: flex; flex-direction: column; height: 100%; font: 13px monospace; color: #ccc; background: #000; }
+  /* The stage is everything the game may use: the whole window, or the whole screen in fullscreen. fit() sizes the canvas to the largest rectangle of
+     its own shape that fits, and the engine reshapes its render resolution to the stage (web/platform/view_web.cpp), so the picture fills it. */
+  #stage { position: relative; flex: 1 1 0; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #000; }
+  canvas { display: block; flex: none; background: #000; cursor: none; outline: none; }
+  /* the engine log: hidden unless the page is opened with ?log (it is always in #log's text, for scripts) */
+  #log { display: none; }
+  #wrap.showlog:not(.fs) #log { display: block; flex: 0 0 170px; overflow: auto; white-space: pre-wrap; padding: 6px; border-top: 1px solid #333; background: #111; }
+  /* start-up feedback while the engine loads (the log is hidden): its latest line, until the engine runs */
+  #status { position: absolute; left: 12px; bottom: 12px; max-width: calc(100% - 24px); box-sizing: border-box; padding: 5px 9px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+            background: rgba(0, 0, 0, .6); color: #8fa396; font: 12px/1.3 ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+  #wrap.showlog #status { display: none; }
+  /* fullscreen button: shown while the mouse moves (not while it is locked for aiming) */
+  #fsBtn { position: absolute; top: 14px; right: 14px; z-index: 5; display: grid; place-items: center; width: 40px; height: 40px; padding: 0; border: 1px solid rgba(255, 255, 255, .28);
+           border-radius: 6px; background: rgba(0, 0, 0, .5); color: #fff; cursor: pointer; opacity: 0; pointer-events: none; transition: opacity .2s ease, background .15s ease; }
+  #fsBtn svg { width: 20px; height: 20px; }
+  #fsBtn .exit, #wrap.fs #fsBtn .enter { display: none; }
+  #wrap.fs #fsBtn .exit { display: block; }
+  #wrap.ui #fsBtn { opacity: 1; pointer-events: auto; }
+  #fsBtn:hover { background: rgba(0, 0, 0, .8); border-color: rgba(255, 255, 255, .6); }
 </style>
 </head>
 <body>
@@ -125,6 +149,7 @@
       <span class="glow"><button id="startBtn" class="start" type="button" disabled><span>Start</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="square" aria-hidden="true"><path d="M3 12h16M13 5l7 7-7 7"/></svg></button></span>
       <span class="hint" id="hint" hidden>or press <kbd>Enter</kbd></span>
+      <label class="fsopt" id="fsOpt" hidden><input type="checkbox" id="fsStart"><span>Fullscreen</span></label>
     </div>
     <p class="profile" id="profileLine" hidden>
       <span id="profileText"></span><button type="button" class="link" id="exportBtn" disabled>Export</button><button type="button" class="link" id="importBtn">Import</button>
@@ -136,8 +161,15 @@
 </main>
 
 <div id="wrap" hidden>
-  <canvas id="canvas" width="1280" height="720" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
-  <div id="audioHint" style="display:none;position:fixed;top:8px;left:8px;padding:4px 8px;background:#000a;color:#fc6;border:1px solid #fc6;font:12px monospace;pointer-events:none">&#128263; click or press a key to enable sound</div>
+  <div id="stage">
+    <canvas id="canvas" width="1280" height="720" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+    <button id="fsBtn" type="button" tabindex="-1" title="Fullscreen (F11 or Alt+Enter)" aria-label="Toggle fullscreen">
+      <svg class="enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      <svg class="exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+    </button>
+    <div id="status" hidden></div>
+    <div id="audioHint" style="display:none;position:fixed;top:8px;left:8px;padding:4px 8px;background:#000a;color:#fc6;border:1px solid #fc6;font:12px monospace;pointer-events:none">&#128263; click or press a key to enable sound</div>
+  </div>
   <div id="log"></div>
 </div>
 
@@ -152,12 +184,28 @@
     const $ = (id) => document.getElementById(id);
     const btn = $('startBtn');
 
-    window.startGame = function () {
+    // "Fullscreen" option next to Start (remembered; on unless the player turned it off). Not offered where the browser cannot do it (iPhone).
+    const fsBox = $('fsStart');
+    const canFs = !!(document.fullscreenEnabled && $('wrap').requestFullscreen);
+    if (canFs) {
+      let saved = null; try { saved = localStorage.getItem('kisak.fullscreen'); } catch (e) {}
+      fsBox.checked = saved !== '0';
+      $('fsOpt').hidden = false;
+    }
+
+    window.startGame = async function () {
       if (window.__gameStarted) return;
       window.__gameStarted = true;
+      const wantFs = canFs && fsBox.checked;
+      if (canFs) { try { localStorage.setItem('kisak.fullscreen', wantFs ? '1' : '0'); } catch (e) {} }
       $('wrap').hidden = false;                                 // the canvas must be laid out before the engine measures it
       $('start').classList.add('leaving');
       setTimeout(() => { $('start').hidden = true; }, 500);
+      if (wantFs) await kisakView.enterFullscreen();            // (first: this click is the user gesture the browser wants for it)
+      kisakView.fit();
+      // The shape of the area the game is shown in, so the first renderer already has the right aspect ratio (web/platform/view_web.cpp).
+      const stage = kisakView.size();
+      if (stage.w > 0 && stage.h > 0) Module.arguments.push('--view=' + stage.w + 'x' + stage.h);
       const src = $('gameScript').content.querySelector('script').getAttribute('src');
       const s = document.createElement('script');
       s.src = src;
@@ -282,7 +330,8 @@
       });
     }
 
-    if (!problems.length && new URLSearchParams(location.search).has('autostart')) window.startGame();   // for development: skip the button
+    // for development: skip the button (deferred: startGame uses kisakView, which the script defines further down)
+    if (!problems.length && new URLSearchParams(location.search).has('autostart')) setTimeout(window.startGame, 0);
   })();
 
   // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -296,7 +345,110 @@
     location.replace(u.href);
   }
   var logEl = document.getElementById('log');
-  function addLog(s) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+  var statusEl = document.getElementById('status'), engineUp = false;
+  function addLog(s) {
+    logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight;
+    if (!engineUp) {                                           // the log is hidden: show the latest line while the engine starts (it can take minutes on a cold cache)
+      if (s.indexOf('entering frame loop') >= 0) { engineUp = true; statusEl.hidden = true; }
+      else if (s) { statusEl.textContent = s; statusEl.hidden = false; }
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  // the game's window: fullscreen, fitting the canvas to the stage, telling the engine the stage's shape
+  // ---------------------------------------------------------------------------------------------------------------------------------------
+  // The stage (#stage) is the whole window, or the whole screen in fullscreen. The canvas is shown as large as fits at its own aspect ratio (a CSS size,
+  // so the engine's mouse mapping stays exact), and the engine is told the stage's shape (shared memory, see web/platform/view_web.cpp) so its render
+  // resolution has that shape too: the picture then fills the stage with no bars. Fullscreen = the Fullscreen API on #wrap: the browser's own toolbar
+  // and everything else of the page disappear. Esc is locked to the page while fullscreen (keyboard lock), so it still opens the in-game menu and
+  // exiting fullscreen takes a long press of Esc, as the browser's hint says; where keyboard lock is missing Esc leaves fullscreen first.
+  var kisakView = (function () {
+    const $ = (id) => document.getElementById(id);
+    const wrap = $('wrap'), stage = $('stage'), canvas = $('canvas'), fsBtn = $('fsBtn');
+    const canFs = !!(document.fullscreenEnabled && wrap.requestFullscreen);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    if (new URLSearchParams(location.search).has('log')) wrap.classList.add('showlog');
+    if (!canFs) fsBtn.hidden = true;
+
+    function size() { return { w: stage.clientWidth, h: stage.clientHeight }; }
+
+    function fit() {                                           // largest rectangle of the canvas's shape inside the stage
+      const sw = stage.clientWidth, sh = stage.clientHeight, cw = canvas.width, ch = canvas.height;
+      if (!sw || !sh || !cw || !ch) return;
+      const k = Math.min(sw / cw, sh / ch);
+      const w = Math.round(cw * k) + 'px', h = Math.round(ch * k) + 'px';
+      if (canvas.style.width !== w) canvas.style.width = w;
+      if (canvas.style.height !== h) canvas.style.height = h;
+    }
+
+    // ---- the engine's request block (view_web.cpp): { w, h, seq } as int32 in shared wasm memory
+    let ctl = null, reportTimer = 0;
+    function report() {
+      const s = size();
+      if (!ctl || !s.w || !s.h) return;
+      Atomics.store(ctl.i32, ctl.at, s.w); Atomics.store(ctl.i32, ctl.at + 1, s.h); Atomics.add(ctl.i32, ctl.at + 2, 1);
+    }
+    function scheduleReport() { clearTimeout(reportTimer); reportTimer = setTimeout(report, 500); }   // (wait for a drag-resize / the fullscreen animation to end)
+    function attach(mem, ptr) { ctl = { i32: new Int32Array(mem.buffer), at: ptr >> 2 }; report(); }
+
+    // ---- fullscreen
+    async function toggle() {
+      if (!canFs) return;
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await wrap.requestFullscreen({ navigationUI: 'hide' });
+      } catch (e) { addLog('[fullscreen] ' + e); }
+    }
+    // For Start: enter fullscreen and wait until the layout has settled (macOS animates it for a moment), so the first size the engine sees is final.
+    async function enterFullscreen() {
+      // (a browser that never settles the request, e.g. an embedded view, must not keep the game from starting: give up after 2 s)
+      try { await Promise.race([wrap.requestFullscreen({ navigationUI: 'hide' }), sleep(2000).then(() => { throw new Error('no answer'); })]); }
+      catch (e) { addLog('[fullscreen] ' + e); return; }
+      let last = '', same = 0;
+      for (let t = 0; t < 20 && same < 3; t++) {
+        await sleep(100);
+        const s = size(), k = s.w + 'x' + s.h;
+        same = k === last ? same + 1 : 0; last = k;
+      }
+    }
+    document.addEventListener('fullscreenchange', () => {
+      const fs = !!document.fullscreenElement;
+      wrap.classList.toggle('fs', fs);
+      if (navigator.keyboard) {
+        if (fs && navigator.keyboard.lock) navigator.keyboard.lock(['Escape']).catch(() => {});
+        else if (navigator.keyboard.unlock) navigator.keyboard.unlock();
+      }
+      canvas.focus();
+      fit(); scheduleReport();
+    });
+    fsBtn.addEventListener('click', () => { toggle(); canvas.focus(); });
+    // F11 / Alt+Enter (Option+Enter on a Mac) toggle it. Handled here, first, so the engine never sees them; the browser's own F11 is replaced
+    // (it would make the toolbar-less "browser fullscreen" that leaves the page's toolbar and log in view on some systems).
+    const isToggleKey = (e) => e.code === 'F11' || (e.code === 'Enter' && e.altKey && !e.ctrlKey && !e.metaKey);
+    document.addEventListener('keydown', (e) => {
+      if (!window.__gameStarted || !isToggleKey(e)) return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (!e.repeat) toggle();
+    }, true);
+    document.addEventListener('keyup', (e) => { if (window.__gameStarted && isToggleKey(e)) { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+
+    // ---- the button appears while the mouse moves (a locked mouse, i.e. aiming, does not show it)
+    let uiTimer = 0;
+    function showUi() {
+      if (document.pointerLockElement) return;
+      wrap.classList.add('ui');
+      clearTimeout(uiTimer);
+      uiTimer = setTimeout(() => { if (fsBtn.matches(':hover')) showUi(); else wrap.classList.remove('ui'); }, 2500);
+    }
+    wrap.addEventListener('mousemove', showUi);
+    document.addEventListener('pointerlockchange', () => { if (document.pointerLockElement) wrap.classList.remove('ui'); });
+
+    window.addEventListener('resize', () => { fit(); scheduleReport(); });
+    setInterval(fit, 250);                                     // the render resolution (the canvas's own size) changes when the engine restarts its renderer
+    return { fit, size, attach, toggle, enterFullscreen };
+  })();
+  // the engine thread calls this once (platform/view_web.cpp): where to write the stage's size
+  function kisakViewAttach(mem, ptr) { kisakView.attach(mem, ptr); }
   // ---- audio: the engine's mixer thread (web/audio/al_web.cpp) calls this once its device opens. The AudioContext starts
   // suspended unless the page already had a user gesture (the Start button counts) and is resumed by the first click/key press.
   var kisakAudio = {};

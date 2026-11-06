@@ -4170,6 +4170,13 @@ void __cdecl R_SetWndParms(GfxWindowParms *wndParms)
         resolutionString = Dvar_EnumToString(r_mode);
         sscanf(resolutionString, "%ix%i", &wndParms->displayWidth, &wndParms->displayHeight);
     }
+#ifdef KISAK_WEB
+    // The browser shows the game in a window or a fullscreen screen of any shape: reshape the resolution to it (web/platform/view_web.cpp).
+    // An explicit r_customMode still wins.
+    void kisak_fit_display(int *width, int *height);
+    if (!wndParms->fullscreen && !r_customMode->current.string[0])
+        kisak_fit_display(&wndParms->displayWidth, &wndParms->displayHeight);
+#endif
     wndParms->sceneWidth = wndParms->displayWidth;
     wndParms->sceneHeight = wndParms->displayHeight;
     if (wndParms->fullscreen)

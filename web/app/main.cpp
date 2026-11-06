@@ -23,6 +23,7 @@
 #include <emscripten.h>
 #include <emscripten/html5.h>
 #include "../shim/kvfs.h"
+#include "../platform/view_web.h"
 #include <web_prof.h>
 
 extern char sys_cmdline[1024];
@@ -53,6 +54,7 @@ extern bool g_webQuitting;   // platform/sys_web.cpp: the engine has quit (Quit 
 static void FrameCb(void *)
 {
     if (g_webQuitting) return;
+    webview::Frame();   // (queues a vid_restart when the page's window changed shape)
     double t0 = emscripten_get_now();
     double interval = g_lastFrameStartMs > 0 ? t0 - g_lastFrameStartMs : 0;
     g_lastFrameStartMs = t0;
@@ -111,10 +113,14 @@ int main(int argc, char **argv)
         if (!strncmp(argv[i], "--prof-hitch=", 13)) { profHitch = atof(argv[i] + 13); continue; }
         if (!strcmp(argv[i], "--fsstats")) { setenv("KISAK_FSSTATS", "1", 1); continue; }
         if (!strcmp(argv[i], "--fstrace")) { setenv("KISAK_FSSTATS", "2", 1); continue; }   // log game-data request statistics every 5 s
+        // --view=WxH: the size (CSS px) of the area the page shows the game in, measured by the page when Start was pressed, so the very first
+        // renderer already has the window's shape (platform/view_web.cpp; later changes arrive through shared memory).
+        if (!strncmp(argv[i], "--view=", 7)) { int vw = 0, vh = 0; if (sscanf(argv[i] + 7, "%dx%d", &vw, &vh) == 2) webview::SetInitial(vw, vh); continue; }
         strncat(cmd, " ", sizeof cmd - strlen(cmd) - 1);
         strncat(cmd, argv[i], sizeof cmd - strlen(cmd) - 1);
     }
     if (profOn) webprof::Init(profHitch);
+    webview::Attach();   // the page now reports its size changes through shared memory
     I_strncpyz(sys_cmdline, cmd, 1024);
     Sys_Milliseconds();
     Profile_Init();
