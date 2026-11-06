@@ -24,6 +24,12 @@ namespace d3dgl {
 
 void Log(const char *fmt, ...);
 
+// Diagnostic switches (console command `gfxexp <mask>`, see platform/devcmds_web.cpp): each bit skips one class of GL work so its cost in the
+// browser's GPU process can be measured in a fixed scene. 1 = glDraw*, 2 = constant uploads, 4 = vertex attribute setup, 8 = texture binds,
+// 16 = buffer data uploads, 32 = draw only 3 indices, 64 = 1x1 viewport. 0 (normal) in every real run.
+extern int g_gfxExp;
+void SetGfxExperiment(int mask);
+
 // The engine requires the memory it gets from Lock() to be 16-byte aligned (e.g. R_LockSkinnedCache rejects the lock - and so
 // disables model skinning for that frame - when (ptr & 15) != 0), but std::vector only guarantees malloc alignment (8 in wasm).
 template <class T, size_t Align>
@@ -74,6 +80,22 @@ size_t LevelBytes(const FmtInfo &fi, UINT w, UINT h, UINT d, UINT *pitchOut, UIN
 
 struct Device;
 
+// ---- GL binding cache. Every GL call costs time in the browser's GPU process (Chrome validates + re-encodes it for ANGLE), and the
+// D3D9 -> GL translation used to re-issue the same bindings on every draw (2-3 calls per sampler, 3-4 per vertex attribute, ...). Everything
+// that binds a buffer or a texture goes through these helpers so the cache stays truthful.
+struct BindCache {
+    GLuint arrayBuf = 0, elemBuf = 0;
+    GLuint tex[16][3] = {};      // per texture unit: 2D, cube, 3D
+    GLuint samp[16] = {};
+};
+extern BindCache g_bind;
+inline void BindBufferCached(GLenum target, GLuint id)
+{
+    if (target == GL_ARRAY_BUFFER) { if (g_bind.arrayBuf == id) return; g_bind.arrayBuf = id; }
+    else if (target == GL_ELEMENT_ARRAY_BUFFER) { if (g_bind.elemBuf == id) return; g_bind.elemBuf = id; }
+    glBindBuffer(target, id);
+}
+
 // GL objects are only ever deleted by the GL thread: destructors (which may run on the fastfile thread) queue the ids here and
 // the device drains the queue (DrainDeferredDeletes) at the start of every frame / draw batch.
 void DeferDelete(int kind, GLuint id);      // kind: 0 texture, 1 buffer, 2 renderbuffer, 3 query
@@ -107,6 +129,7 @@ struct TexCore {
     struct Level { Bytes data; bool dirty = false; };
     std::vector<Level> lv;  // faces * levels, index = face * levels + level
     std::mutex lock;
+    std::atomic<bool> uploadPending{true};   // some level has dirty CPU data (lets ensureGL return without locking or touching GL)
 
     void init(UINT w_, UINT h_, UINT d_, UINT levels_, D3DFORMAT f, DWORD u, D3DPOOL p, int faces_);
     void levelDims(UINT level, UINT *lw, UINT *lh, UINT *ld) const;
@@ -211,16 +234,28 @@ struct Surface : RefImpl<IDirect3DSurface9> {
 };
 
 // ---------------------------------------------------------------- buffers
+// A byte range of a streamed (dynamic) index buffer that currently lives in a pooled GL buffer (see IndexBuffer::resolve).
+struct StreamSeg { size_t lo, hi; int slot; uint32_t gen; };
+
 struct BufferCore {
     Bytes cpu;
+    bool streamed = false;                // dynamic index buffer: uploaded per draw into a pool of small GL buffers instead of in place
+    std::vector<StreamSeg> segs;          // (streamed only; guarded by `lock`)
     GLuint buf = 0;
     GLenum target = GL_ARRAY_BUFFER;
     size_t dirtyLo = (size_t)-1, dirtyHi = 0;
     bool created = false;
     std::mutex lock;
     DWORD usage = 0;
+    size_t writtenLimit = (size_t)-1;   // kisak_buffer_written(): the next Unlock marks dirty only [lockOffset, writtenLimit)
     void init(UINT size, GLenum tgt, DWORD u) { cpu.assign(size, 0); target = tgt; usage = u; dirtyLo = 0; dirtyHi = size; }
-    void touch(size_t lo, size_t hi) { std::lock_guard<std::mutex> g(lock); if (lo < dirtyLo) dirtyLo = lo; if (hi > dirtyHi) dirtyHi = hi; }
+    void touch(size_t lo, size_t hi)
+    {
+        std::lock_guard<std::mutex> g(lock);
+        if (lo < dirtyLo) dirtyLo = lo;
+        if (hi > dirtyHi) dirtyHi = hi;
+        if (streamed) for (size_t i = 0; i < segs.size();) { if (segs[i].lo < hi && lo < segs[i].hi) segs.erase(segs.begin() + i); else ++i; }   // stale copies
+    }
     void sync();     // GL thread: create + upload dirty range
     void destroyGL();
 };
@@ -243,6 +278,8 @@ struct IndexBuffer : RefImpl<IDirect3DIndexBuffer9> {
     UINT lockOffset = 0, lockSize = 0;
     IndexBuffer(Device *d) : dev(d) {}
     ~IndexBuffer() override;
+    // GL thread: the GL buffer + byte offset to draw bytes [lo, hi) of this index buffer from.
+    void resolve(size_t lo, size_t hi, GLuint *glBuf, size_t *glOffset);
     HRESULT __stdcall GetDevice(IDirect3DDevice9 **dev) override;
     DWORD __stdcall SetPriority(DWORD) override { return 0; }
     void __stdcall PreLoad() override {}

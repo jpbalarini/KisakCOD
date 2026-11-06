@@ -99,3 +99,7 @@ void __cdecl R_SkinXSurfaceSkinnedSse(const XSurface *, const DObjSkelMat *, Gfx
     fprintf(stderr, "R_SkinXSurfaceSkinnedSse called in the web build (sys_SSE should be off)\n");
     __builtin_trap();
 }
+
+// ---- kisak_buffer_written (shim/d3d9.h): the real implementation lives in the WebGL device (gfx/d3d9_gl_resources.cpp); the node load test has no device
+__attribute__((weak)) void kisak_buffer_written(IDirect3DVertexBuffer9 *, unsigned) {}
+__attribute__((weak)) void kisak_buffer_written(IDirect3DIndexBuffer9 *, unsigned) {}

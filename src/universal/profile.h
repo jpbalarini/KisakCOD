@@ -1442,7 +1442,11 @@ const char *__cdecl Profile_MissingEnd();
 void __cdecl Profile_Begin(int index);
 int __cdecl Profile_EndInternal(long double *duration);
 
+#ifdef KISAK_WEB
+#include <web_prof.h>   // PROF_SCOPED -> web/shim/web_prof.h (timed when the page is opened with ?args=--prof)
+#else
 #define PROF_SCOPED(name) // Disable Profiling without Tracy
+#endif
 #define PROFLOAD_SCOPED(name) PROF_SCOPED(name)
 #define ZoneText(str, len)
 #define ZoneTextF(fmt, ...)

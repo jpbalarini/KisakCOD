@@ -165,6 +165,9 @@ uint16_t *__cdecl R_AllocPreTessIndices(int count)
 void __cdecl R_EndPreTess()
 {
     iassert( gfxBuf.preTessIndexBuffer->indices != NULL );
+#ifdef KISAK_WEB
+    kisak_buffer_written(gfxBuf.preTessIndexBuffer->buffer, 2 * gfxBuf.preTessIndexBuffer->used);   // whole buffer locked, `used` indices filled
+#endif
     R_UnlockIndexBuffer(gfxBuf.preTessIndexBuffer->buffer);
     gfxBuf.preTessIndexBuffer->indices = 0;
 }

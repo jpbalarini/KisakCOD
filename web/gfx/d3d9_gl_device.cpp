@@ -3,6 +3,7 @@
 // Conventions (see shader_xlate.h): D3D render targets are stored in D3D row order (row 0 = top), achieved by flipping y in
 // every vertex shader; clip-space z is remapped [0,w] -> [-w,w]; the backbuffer is an FBO that Present() blits (flipped) to the canvas.
 #include "d3d9_gl_internal.h"
+#include <web_prof.h>
 
 #include <emscripten/html5.h>
 #include <stdarg.h>
@@ -19,6 +20,8 @@ namespace d3dgl {
 static std::atomic<uint32_t> g_surfaceIds{1};
 static std::atomic<uint64_t> g_shaderUids{1};
 static bool g_glDebug = false;
+int g_gfxExp = 0;
+void SetGfxExperiment(int mask) { g_gfxExp = mask; Log("gfx experiment mask = %d", mask); }
 static bool g_s3tc = false, g_floatLinear = false, g_colorBufferFloat = false, g_aniso = false;
 static float g_maxAniso = 1.0f;
 static int g_activeUnit = 0;
@@ -38,6 +41,7 @@ void Log(const char *fmt, ...)
 }
 
 uint32_t NextSurfaceId() { return g_surfaceIds++; }
+void InstallBufferUploadReport();
 bool S3tcAvailable() { return g_s3tc; }
 bool S3tcSupported() { return g_s3tc; }
 
@@ -174,7 +178,11 @@ struct Device : RefImpl<IDirect3DDevice9> {
         a.majorVersion = 2; a.minorVersion = 0;
         a.alpha = 0; a.depth = 0; a.stencil = 0; a.antialias = 0;
         a.premultipliedAlpha = 0; a.preserveDrawingBuffer = 0; a.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
-        a.explicitSwapControl = 1; a.renderViaOffscreenBackBuffer = 1; a.enableExtensionsByDefault = 1;
+        // explicitSwapControl makes emscripten hand the canvas to this worker as an OffscreenCanvas. renderViaOffscreenBackBuffer stays OFF: with
+        // it, emscripten_webgl_commit_frame() runs a second full-screen blit wrapped in gl.getParameter() calls, which are synchronous round
+        // trips to the GPU process and stalled the engine thread for the whole time that process needed to execute the frame (20-60 ms).
+        // Our own backbuffer FBO is blitted straight to the canvas in presentFrame(); the browser presents it when the frame task ends.
+        a.explicitSwapControl = 1; a.renderViaOffscreenBackBuffer = 0; a.enableExtensionsByDefault = 1;
         ctx = emscripten_webgl_create_context("#canvas", &a);
         if (ctx <= 0) { Log("emscripten_webgl_create_context failed (%d)", (int)ctx); return false; }
         emscripten_webgl_make_context_current(ctx);
@@ -190,16 +198,19 @@ struct Device : RefImpl<IDirect3DDevice9> {
         Log("WebGL2: %s | %s | s3tc=%d floatLinear=%d colorBufferFloat=%d aniso=%.0f glDebug=%d", glGetString(GL_VENDOR), glGetString(GL_RENDERER),
             (int)g_s3tc, (int)g_floatLinear, (int)g_colorBufferFloat, g_maxAniso, (int)g_glDebug);
         g_device = this;
+        if (webprof::g_on) InstallBufferUploadReport();
 
         emscripten_set_canvas_element_size("#canvas", (int)pp.BackBufferWidth, (int)pp.BackBufferHeight);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glGenVertexArrays(1, &vao);
         glBindVertexArray(vao);
         glGenBuffers(2, ubo);
+        // The two constant buffers stay bound to a target each for the whole run (UNIFORM_BUFFER <- VS, COPY_WRITE_BUFFER <- PS), so
+        // uploading constants needs no glBindBuffer. glBindBufferBase also sets the generic target, hence base 1 first, then base 0.
+        glBindBuffer(GL_COPY_WRITE_BUFFER, ubo[1]); glBufferData(GL_COPY_WRITE_BUFFER, sizeof psConst, nullptr, GL_DYNAMIC_DRAW);
         glBindBuffer(GL_UNIFORM_BUFFER, ubo[0]); glBufferData(GL_UNIFORM_BUFFER, sizeof vsConst, nullptr, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_UNIFORM_BUFFER, ubo[1]); glBufferData(GL_UNIFORM_BUFFER, sizeof psConst, nullptr, GL_DYNAMIC_DRAW);
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo[0]);
         glBindBufferBase(GL_UNIFORM_BUFFER, 1, ubo[1]);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo[0]);
         glGenBuffers(1, &dynVB);
         glGenFramebuffers(1, &blitRead);
         glGenFramebuffers(1, &blitDraw);
@@ -323,7 +334,9 @@ struct Device : RefImpl<IDirect3DDevice9> {
         if (k == curFbo) return;
         GLuint f = getFBO(rt, ds);
         glBindFramebuffer(GL_FRAMEBUFFER, f);
+        WEBPROF_COUNT("rtSwitch", 1);
         curFbo = k;
+        if (webprof::g_on) { gpuSegEnd(); gpuSegBegin(); }
         gl.attribMask = gl.attribMask;  // unchanged
         // viewport & scissor depend on the target: force re-issue
         gl.vpw = -1; gl.sw = -1;
@@ -339,6 +352,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
     {
         UINT rw, rh; rtSize(&rw, &rh);
         int x = (int)vp.X, y = (int)vp.Y, w = (int)vp.Width, h = (int)vp.Height;
+        if (g_gfxExp & 64) { w = 1; h = 1; }   // experiment: no fragment work
         if (x != gl.vpx || y != gl.vpy || w != gl.vpw || h != gl.vph) { glViewport(x, y, w, h); gl.vpx = x; gl.vpy = y; gl.vpw = w; gl.vph = h; }
         if (vp.MinZ != gl.zn || vp.MaxZ != gl.zf) { glDepthRangef(vp.MinZ, vp.MaxZ); gl.zn = vp.MinZ; gl.zf = vp.MaxZ; }
         int sc = rs[D3DRS_SCISSORTESTENABLE] ? 1 : 0;
@@ -497,6 +511,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
         auto key = std::make_pair(vs->uid, std::make_pair(ps->uid, sm));
         auto it = programs.find(key);
         if (it != programs.end()) return it->second;
+        PROF_SCOPED("gl:programBuild"); WEBPROF_COUNT("programBuilds", 1);
         Program *pr = new Program();
         programs[key] = pr;
         pr->vs = vs; pr->ps = ps;
@@ -615,23 +630,30 @@ struct Device : RefImpl<IDirect3DDevice9> {
                     if (ss[s].srgb) srgb |= 1u << s;
                 }
             }
-            if (g_activeUnit != s) { glActiveTexture(GL_TEXTURE0 + s); g_activeUnit = s; }
-            glBindTexture(target, t);
-            glBindSampler(s, samplerObject(ss[s], compare, noLinear, hasMips));
+            int ki = kind == d3dxlate::SAMP_CUBE ? 1 : kind == d3dxlate::SAMP_VOLUME ? 2 : 0;
+            if (!(g_gfxExp & 8) && g_bind.tex[s][ki] != t) {
+                if (g_activeUnit != s) { glActiveTexture(GL_TEXTURE0 + s); g_activeUnit = s; }
+                glBindTexture(target, t);
+                g_bind.tex[s][ki] = t;
+                WEBPROF_COUNT("texBind", 1);
+            }
+            GLuint so = samplerObject(ss[s], compare, noLinear, hasMips);
+            if (!(g_gfxExp & 8) && g_bind.samp[s] != so) { glBindSampler(s, so); g_bind.samp[s] = so; WEBPROF_COUNT("sampBind", 1); }
         }
         *srgbReadMask = srgb;
     }
 
     void uploadConstants()
     {
+        if (g_gfxExp & 2) { vsLo = 256; vsHi = 0; psLo = 224; psHi = 0; return; }
         if (vsHi > vsLo) {
-            glBindBuffer(GL_UNIFORM_BUFFER, ubo[0]);
             glBufferSubData(GL_UNIFORM_BUFFER, vsLo * 16, (vsHi - vsLo) * 16, vsConst + vsLo * 4);
+            WEBPROF_COUNT("constUploads", 1); WEBPROF_COUNT("constBytes", (vsHi - vsLo) * 16);
             vsLo = 256; vsHi = 0;
         }
         if (psHi > psLo) {
-            glBindBuffer(GL_UNIFORM_BUFFER, ubo[1]);
-            glBufferSubData(GL_UNIFORM_BUFFER, psLo * 16, (psHi - psLo) * 16, psConst + psLo * 4);
+            glBufferSubData(GL_COPY_WRITE_BUFFER, psLo * 16, (psHi - psLo) * 16, psConst + psLo * 4);
+            WEBPROF_COUNT("constUploads", 1); WEBPROF_COUNT("constBytes", (psHi - psLo) * 16);
             psLo = 224; psHi = 0;
         }
     }
@@ -662,6 +684,10 @@ struct Device : RefImpl<IDirect3DDevice9> {
         }
     }
 
+    // Vertex attribute state as last sent to GL (per location), so an unchanged attribute costs no GL call at all.
+    struct AttrCache { GLuint buf = 0; GLint size = 0; GLenum type = 0; GLboolean norm = 0; GLsizei stride = 0; size_t off = 0; bool enabled = false, constDefault = false; };
+    AttrCache attr[16];
+
     // `baseVertex` is added to every stream's start; returns the u_bgra mask for the VS inputs
     int setupVertexInputs(Program *pr, INT baseVertex, bool *ok)
     {
@@ -669,29 +695,38 @@ struct Device : RefImpl<IDirect3DDevice9> {
         int bgra = 0;
         uint32_t enabled = 0;
         const auto &inputs = pr->vs->info.inputs;
+        VertexBuffer *synced[16]; int nSynced = 0;
         for (size_t k = 0; k < inputs.size(); ++k) {
             const d3dxlate::Semantic &sem = inputs[k];
             int loc = AttribLoc(sem.key());
+            AttrCache &ac = attr[loc];
             const D3DVERTEXELEMENT9 *el = nullptr;
             if (decl) for (auto &e : decl->elems) if (e.Usage == sem.usage && e.UsageIndex == sem.index) { el = &e; break; }
             ElemGL eg;
             if (!el || el->Stream >= 16 || !streams[el->Stream].vb || !ElemFormat(el->Type, &eg)) {
-                glDisableVertexAttribArray(loc);
-                glVertexAttrib4f(loc, 0.f, 0.f, 0.f, 1.f);
+                if (ac.enabled) { glDisableVertexAttribArray(loc); ac.enabled = false; }
+                if (!ac.constDefault) { glVertexAttrib4f(loc, 0.f, 0.f, 0.f, 1.f); ac.constDefault = true; }
                 continue;
             }
             Stream &st = streams[el->Stream];
-            st.vb->core.sync();
-            glBindBuffer(GL_ARRAY_BUFFER, st.vb->core.buf);
+            bool already = false;
+            for (int j = 0; j < nSynced; ++j) if (synced[j] == st.vb) { already = true; break; }
+            if (!already) { st.vb->core.sync(); synced[nSynced++] = st.vb; }
             size_t off = (size_t)st.offset + (size_t)(int64_t)baseVertex * st.stride + el->Offset;
-            glVertexAttribPointer((GLuint)loc, eg.size, eg.type, eg.norm, (GLsizei)st.stride, (const void *)off);
-            glEnableVertexAttribArray(loc);
+            GLuint buf = st.vb->core.buf;
+            if (!(g_gfxExp & 4) && (!ac.enabled || ac.buf != buf || ac.size != eg.size || ac.type != eg.type || ac.norm != eg.norm || ac.stride != (GLsizei)st.stride || ac.off != off)) {
+                BindBufferCached(GL_ARRAY_BUFFER, buf);
+                glVertexAttribPointer((GLuint)loc, eg.size, eg.type, eg.norm, (GLsizei)st.stride, (const void *)off);
+                ac.buf = buf; ac.size = eg.size; ac.type = eg.type; ac.norm = eg.norm; ac.stride = (GLsizei)st.stride; ac.off = off;
+                WEBPROF_COUNT("attribPtr", 1);
+            }
+            if (!ac.enabled) { glEnableVertexAttribArray(loc); ac.enabled = true; }
             enabled |= 1u << loc;
             if (eg.isColor) bgra |= 1 << k;
         }
         // disable stale attributes
         uint32_t stale = gl.attribMask & ~enabled;
-        for (int i = 0; stale; ++i, stale >>= 1) if (stale & 1) glDisableVertexAttribArray(i);
+        for (int i = 0; stale; ++i, stale >>= 1) if (stale & 1) { glDisableVertexAttribArray(i); attr[i].enabled = false; }
         gl.attribMask = enabled;
         return bgra;
     }
@@ -700,20 +735,24 @@ struct Device : RefImpl<IDirect3DDevice9> {
     {
         DrainDeferredDeletes();
         if (!vs || !ps) return false;
+        { PROF_SCOPED("gl:state");
         applyRenderTargets();
         applyViewportScissor();
-        applyState();
+        applyState(); }
+        Program *pr;
+        { PROF_SCOPED("gl:program");
         // The shadow mask needs the PS translated once (sampler kinds); translate it against this VS first.
         if (!vs->translated) prepareVS(vs);
         if (!ps->translated && vs->translated) preparePS(ps, vs, 0);
-        Program *pr = getProgram(shadowMaskForPS());
+        pr = getProgram(shadowMaskForPS());
         if (!pr || pr->failed || !pr->prog) return false;
-        if (gl.program != pr->prog) { glUseProgram(pr->prog); gl.program = pr->prog; }
+        if (gl.program != pr->prog) { glUseProgram(pr->prog); gl.program = pr->prog; WEBPROF_COUNT("progSwitch", 1); } }
         uint32_t srgbRead = 0;
-        bindTextures(pr, &srgbRead);
-        uploadConstants();
+        { PROF_SCOPED("gl:textures"); bindTextures(pr, &srgbRead); }
+        { PROF_SCOPED("gl:consts"); uploadConstants(); }
         bool ok;
-        int bgra = setupVertexInputs(pr, baseVertex, &ok);
+        int bgra;
+        { PROF_SCOPED("gl:attribs"); bgra = setupVertexInputs(pr, baseVertex, &ok); }
         if (pr->uBgra >= 0 && bgra != pr->lastBgra) { glUniform1i(pr->uBgra, bgra); pr->lastBgra = bgra; }
         UINT rw, rh; rtSize(&rw, &rh);
         float hp[2] = {1.0f / (float)std::max<UINT>(rw, 1), 1.0f / (float)std::max<UINT>(rh, 1)};
@@ -726,6 +765,25 @@ struct Device : RefImpl<IDirect3DDevice9> {
         if (pr->uSrgbRead >= 0 && (int)srgbRead != pr->lastSrgbR) { glUniform1i(pr->uSrgbRead, (GLint)srgbRead); pr->lastSrgbR = (int)srgbRead; }
         *outPr = pr;
         return true;
+    }
+
+    // profiler: draws / triangles per render target (identifies the pass: main scene, sun shadow map, float-z, post effects...)
+    void countDrawPass(UINT primCount)
+    {
+        if (!webprof::g_on) return;
+        Surface *r = rt[0] ? rt[0] : ds;
+        if (!r) return;
+        static struct { UINT w, h; int fmt; char draws[40], tris[40]; } names[24]; static int n = 0;
+        int i = 0;
+        for (; i < n; ++i) if (names[i].w == r->w && names[i].h == r->h && names[i].fmt == (int)r->fmt) break;
+        if (i == n) {
+            if (n == 24) return;
+            names[n].w = r->w; names[n].h = r->h; names[n].fmt = (int)r->fmt;
+            snprintf(names[n].draws, sizeof names[n].draws, "dr[%ux%u f%d]", r->w, r->h, (int)r->fmt);
+            snprintf(names[n].tris, sizeof names[n].tris, "tri[%ux%u f%d]", r->w, r->h, (int)r->fmt);
+            ++n;
+        }
+        webprof::Count(names[i].draws, 1); webprof::Count(names[i].tris, primCount);
     }
 
     static GLenum PrimMode(D3DPRIMITIVETYPE t, UINT primCount, UINT *count)
@@ -752,14 +810,68 @@ struct Device : RefImpl<IDirect3DDevice9> {
         pp = *p;
         if (pp.BackBufferWidth && pp.BackBufferHeight) emscripten_set_canvas_element_size("#canvas", (int)pp.BackBufferWidth, (int)pp.BackBufferHeight);
         resetStateDefaults();
+        uint32_t attribMask = gl.attribMask;
         gl = GLCache();
         gl.program = ~0u;
+        gl.attribMask = attribMask;   // GL's attribute enables are unchanged by a D3D Reset
         createBackbuffer();
         return D3D_OK;
     }
 
+    // ---- optional GPU timers (only with ?args=--prof): EXT_disjoint_timer_query_webgl2 around each run of draws to one render target, so the
+    // report can say how much GPU time the shadow map / float-z pass / main scene / post effects take (counters "gpu[WxH fFMT]" in ms per frame).
+    struct GpuSeg { GLuint q = 0; bool busy = false; const char *tag = nullptr; };
+    GpuSeg gpuSegs[48]; int gpuSegNext = 0; bool gpuSegActive = false, gpuTimerInit = false, gpuTimerOk = false;
+    bool profSync = false;
+    const char *rtTag(bool *ok)
+    {
+        static struct { UINT w, h; int fmt; char name[40]; } names[24]; static int n = 0;
+        Surface *r = rt[0] ? rt[0] : ds;
+        *ok = r != nullptr;
+        if (!r) return nullptr;
+        for (int i = 0; i < n; ++i) if (names[i].w == r->w && names[i].h == r->h && names[i].fmt == (int)r->fmt) return names[i].name;
+        if (n == 24) return "gpu[other]";
+        names[n].w = r->w; names[n].h = r->h; names[n].fmt = (int)r->fmt;
+        snprintf(names[n].name, sizeof names[n].name, "gpu[%ux%u f%d]", r->w, r->h, (int)r->fmt);
+        return names[n++].name;
+    }
+    void gpuTimerPoll()
+    {
+        for (GpuSeg &g : gpuSegs) {
+            if (!g.busy) continue;
+            GLuint avail = 0; glGetQueryObjectuiv(g.q, GL_QUERY_RESULT_AVAILABLE, &avail);
+            if (!avail) continue;
+            GLint disjoint = 0; glGetIntegerv(0x8FBB /*GPU_DISJOINT_EXT*/, &disjoint);
+            GLuint ns = 0; glGetQueryObjectuiv(g.q, GL_QUERY_RESULT, &ns);
+            g.busy = false;
+            if (!disjoint) { WEBPROF_COUNT("gpuMs", ns / 1.0e6); if (g.tag) webprof::Count(g.tag, ns / 1.0e6); }
+        }
+    }
+    void gpuSegEnd() { if (gpuSegActive) { glEndQuery(0x88BF /*GL_TIME_ELAPSED_EXT*/); gpuSegActive = false; } }
+    void gpuSegBegin()
+    {
+        if (!webprof::g_on) return;
+        if (!gpuTimerInit) {
+            gpuTimerInit = true;
+            gpuTimerOk = emscripten_webgl_enable_extension(ctx, "EXT_disjoint_timer_query_webgl2") != 0;
+            profSync = getenv("KISAK_PROFSYNC") != nullptr;
+            Log("profiler: GPU timer query %s, glFinish per frame %s", gpuTimerOk ? "available" : "NOT available", profSync ? "on" : "off");
+            if (gpuTimerOk) for (GpuSeg &g : gpuSegs) glGenQueries(1, &g.q);
+        }
+        if (!gpuTimerOk) return;
+        bool ok; const char *tag = rtTag(&ok);
+        if (!ok) return;
+        for (int k = 0; k < 48; ++k) {
+            GpuSeg &g = gpuSegs[(gpuSegNext + k) % 48];
+            if (g.busy) continue;
+            glBeginQuery(0x88BF, g.q); g.busy = true; g.tag = tag; gpuSegActive = true; gpuSegNext = (gpuSegNext + k + 1) % 48;
+            return;
+        }
+    }
+
     HRESULT presentFrame()
     {
+        PROF_SCOPED("gl:present");
         DrainDeferredDeletes();
         // blit the backbuffer to the canvas (default framebuffer), flipping vertically back to GL orientation
         backbuffer->ensureGL();
@@ -770,9 +882,12 @@ struct Device : RefImpl<IDirect3DDevice9> {
         glDisable(GL_SCISSOR_TEST); gl.scissor = 0;
         GLint w = (GLint)backbuffer->w, h = (GLint)backbuffer->h;
         glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        emscripten_webgl_commit_frame();
+        gpuSegEnd();
+        if (webprof::g_on && profSync) { PROF_SCOPED("gl:finish(gpu wait)"); glFinish(); }
+        // (frame is presented by the browser when this task ends; no emscripten_webgl_commit_frame: see init())
         curFbo = {{~0u, ~0u, ~0u, ~0u}, ~0u};
         ++frame;
+        if (webprof::g_on) { gpuTimerPoll(); gpuSegBegin(); }
         return D3D_OK;
     }
     HRESULT __stdcall Present(const RECT *, const RECT *, HWND, const void *) override { return presentFrame(); }
@@ -818,6 +933,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
     {
         IndexBuffer *ib = new IndexBuffer(this);
         ib->core.init(len, GL_ELEMENT_ARRAY_BUFFER, usage); ib->usage = usage; ib->pool = pool; ib->fmt = fmt;
+        ib->core.streamed = (usage & D3DUSAGE_DYNAMIC) != 0 && !getenv("KISAK_NOIDXSTREAM");
         *out = ib;
         return D3D_OK;
     }
@@ -862,7 +978,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
                     UINT sw, sh; a->levelDims(lsrc, &sw, &sh, nullptr);
                     if (sw == dw && sh == dh) {
                         auto &S = a->lv[(size_t)f * ls + lsrc]; auto &D = b->lv[(size_t)f * ld + ldst];
-                        if (!S.data.empty()) { D.data = S.data; D.dirty = true; }
+                        if (!S.data.empty()) { D.data = S.data; D.dirty = true; b->uploadPending.store(true, std::memory_order_release); }
                         break;
                     }
                 }
@@ -901,6 +1017,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
 
     HRESULT __stdcall StretchRect(IDirect3DSurface9 *srcS, const RECT *sr, IDirect3DSurface9 *dstS, const RECT *dr, D3DTEXTUREFILTERTYPE filter) override
     {
+        PROF_SCOPED("gl:stretchRect"); WEBPROF_COUNT("stretchRects", 1);
         Surface *src = static_cast<Surface *>(srcS), *dst = static_cast<Surface *>(dstS);
         if (dst->kind == Surface::K_PLAIN) return D3DERR_INVALIDCALL;
         RECT s = sr ? *sr : RECT{0, 0, (LONG)src->w, (LONG)src->h};
@@ -987,6 +1104,7 @@ struct Device : RefImpl<IDirect3DDevice9> {
 
     HRESULT __stdcall Clear(DWORD count, const void *rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) override
     {
+        PROF_SCOPED("gl:clear"); WEBPROF_COUNT("clears", 1);
         applyRenderTargets();
         GLbitfield mask = 0;
         if ((flags & D3DCLEAR_TARGET) && rt[0]) {
@@ -1045,11 +1163,14 @@ struct Device : RefImpl<IDirect3DDevice9> {
 
     HRESULT __stdcall DrawPrimitive(D3DPRIMITIVETYPE type, UINT startVertex, UINT primCount) override
     {
+        PROF_SCOPED("gl:draw");
         Program *pr;
         if (!prepareDraw((INT)startVertex, &pr)) return D3D_OK;
         UINT count;
         GLenum mode = PrimMode(type, primCount, &count);
-        glDrawArrays(mode, 0, (GLsizei)count);
+        { PROF_SCOPED("gl:glDraw"); if (!(g_gfxExp & 1)) glDrawArrays(mode, 0, (GLsizei)count); }
+        WEBPROF_COUNT("draws", 1); WEBPROF_COUNT("tris", primCount); WEBPROF_COUNT("drawArrays", 1);
+        countDrawPass(primCount);
         ++drawCount;
         checkGL("DrawPrimitive");
         return D3D_OK;
@@ -1057,20 +1178,32 @@ struct Device : RefImpl<IDirect3DDevice9> {
     HRESULT __stdcall DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseVertex, UINT, UINT, UINT startIndex, UINT primCount) override
     {
         if (!ib) return D3DERR_INVALIDCALL;
+        PROF_SCOPED("gl:draw");
         Program *pr;
         if (!prepareDraw(baseVertex, &pr)) return D3D_OK;
-        ib->core.sync();
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->core.buf);
         UINT count;
         GLenum mode = PrimMode(type, primCount, &count);
         bool i32 = ib->fmt == D3DFMT_INDEX32;
-        glDrawElements(mode, (GLsizei)count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, (const void *)((size_t)startIndex * (i32 ? 4 : 2)));
+        size_t ibOffset = (size_t)startIndex * (i32 ? 4 : 2);
+        if (ib->core.streamed) {
+            GLuint glib; ib->resolve(ibOffset, ibOffset + (size_t)count * (i32 ? 4 : 2), &glib, &ibOffset);
+            BindBufferCached(GL_ELEMENT_ARRAY_BUFFER, glib);
+        } else {
+            ib->core.sync();
+            BindBufferCached(GL_ELEMENT_ARRAY_BUFFER, ib->core.buf);
+        }
+        if (g_gfxExp & 32) count = count < 3 ? count : 3;   // experiment: per-call cost only (no vertex work)
+        { PROF_SCOPED("gl:glDraw"); if (!(g_gfxExp & 1)) glDrawElements(mode, (GLsizei)count, i32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, (const void *)ibOffset); }
+        WEBPROF_COUNT("draws", 1); WEBPROF_COUNT("tris", primCount); if (baseVertex) WEBPROF_COUNT("baseVertexDraws", 1);
+        countDrawPass(primCount);
         ++drawCount;
         checkGL("DrawIndexedPrimitive");
         return D3D_OK;
     }
     HRESULT __stdcall DrawPrimitiveUP(D3DPRIMITIVETYPE type, UINT primCount, const void *data, UINT stride) override
     {
+        PROF_SCOPED("gl:drawUP");
+        WEBPROF_COUNT("drawUP", 1);
         UINT count;
         GLenum mode = PrimMode(type, primCount, &count);
         // stream the vertices through a scratch buffer bound as stream 0
@@ -1083,7 +1216,8 @@ struct Device : RefImpl<IDirect3DDevice9> {
         bool ok = prepareDraw(0, &pr);
         if (ok) { glDrawArrays(mode, 0, (GLsizei)count); ++drawCount; checkGL("DrawPrimitiveUP"); }
         streams[0] = saved;
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        BindBufferCached(GL_ARRAY_BUFFER, 0);
+        for (auto &a : attr) a = AttrCache();   // they pointed at the scratch buffer (destroyed below)
         tmp.core.destroyGL();
         tmp.refs = 1000;   // stack object: never delete
         return D3D_OK;
@@ -1123,10 +1257,19 @@ struct Device : RefImpl<IDirect3DDevice9> {
         vs = n;
         return D3D_OK;
     }
+    // Shrinks [reg, reg+count) to the registers whose values actually change (the engine re-sends identical constants all the time); `cur`
+    // points at the current value of `reg`. data/cur advance with reg.
+    static void TrimUnchanged(const float *cur, const float *&data, UINT *reg, UINT *count)
+    {
+        while (*count && !memcmp(cur, data, 16)) { cur += 4; data += 4; ++*reg; --*count; }
+        while (*count && !memcmp(cur + (*count - 1) * 4, data + (*count - 1) * 4, 16)) --*count;
+    }
     HRESULT __stdcall SetVertexShaderConstantF(UINT reg, const float *data, UINT count) override
     {
         if (reg >= 256) return D3DERR_INVALIDCALL;
         if (reg + count > 256) count = 256 - reg;
+        TrimUnchanged(vsConst + reg * 4, data, &reg, &count);
+        if (!count) return D3D_OK;
         memcpy(vsConst + reg * 4, data, (size_t)count * 16);
         vsLo = std::min<int>(vsLo, (int)reg); vsHi = std::max<int>(vsHi, (int)(reg + count));
         return D3D_OK;
@@ -1170,6 +1313,8 @@ struct Device : RefImpl<IDirect3DDevice9> {
     {
         if (reg >= 224) return D3DERR_INVALIDCALL;
         if (reg + count > 224) count = 224 - reg;
+        TrimUnchanged(psConst + reg * 4, data, &reg, &count);
+        if (!count) return D3D_OK;
         memcpy(psConst + reg * 4, data, (size_t)count * 16);
         psLo = std::min<int>(psLo, (int)reg); psHi = std::max<int>(psHi, (int)(reg + count));
         return D3D_OK;

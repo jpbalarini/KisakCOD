@@ -20,7 +20,10 @@ INCS = ['-I' + os.path.join(WEB, 'shim'), '-I' + os.path.join(ROOT, 'src'), '-I'
 # `long double` is 64-bit on MSVC (decompiled "fp2"/"st7" temporaries are just FPU registers) but a 128-bit software-float type on wasm:
 # 220 uses across the engine would be both slower and different-sized (e.g. ui_shared's source_s, win_local's cpuGHz).
 SEMANTICS = ['-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks', '-Xclang', '-mlong-double-64']
-COMMON = ['-O1', '-g0', '-pthread', '-fwasm-exceptions', '-w', '-ferror-limit=0'] + SEMANTICS + DEFS + INCS
+# Optimisation level (KISAK_OPT=O1 gives the old, faster-to-build -O1 objects; changing it needs `--force`, the objects are not tagged). The
+# engine was built at -O1 until the performance work: -O2 is what the Windows build shipped with, and the decompiled code runs ~25-40 % faster.
+OPT = '-' + os.environ.get('KISAK_OPT', 'O2')
+COMMON = [OPT, '-g0', '-pthread', '-fwasm-exceptions', '-w', '-ferror-limit=0'] + SEMANTICS + DEFS + INCS
 CXX = ['em++', '-std=c++20', '-fms-extensions', '-fdelayed-template-parsing', '-msse', '-msimd128', '-Wno-c++11-narrowing',
        '-include', os.path.join(WEB, 'shim', 'kisak_compat.h')] + COMMON
 CC = ['emcc', '-std=gnu11'] + COMMON

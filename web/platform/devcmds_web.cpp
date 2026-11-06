@@ -9,9 +9,15 @@
 #include <qcommon/cmd.h>
 #include <database/database.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static cmd_function_s s_dumpRawFile;
+static cmd_function_s s_dumpRawFile, s_gfxExp;
+namespace d3dgl { void SetGfxExperiment(int); }
+static void GfxExp_f()
+{
+    d3dgl::SetGfxExperiment(Cmd_Argc() > 1 ? atoi(Cmd_Argv(1)) : 0);
+}
 
 static void DumpRawFile_f()
 {
@@ -40,4 +46,5 @@ static void DumpRawFile_f()
 void Web_RegisterCommands()
 {
     Cmd_AddCommandInternal("dumprawfile", DumpRawFile_f, &s_dumpRawFile);
+    Cmd_AddCommandInternal("gfxexp", GfxExp_f, &s_gfxExp);   // diagnostic: skip classes of GL work, see gfx/d3d9_gl_internal.h
 }

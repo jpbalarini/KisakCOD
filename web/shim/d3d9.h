@@ -299,6 +299,14 @@ struct IDirect3DCubeTexture9 : IDirect3DBaseTexture9 {
     virtual HRESULT __stdcall LockRect(D3DCUBEMAP_FACES face, UINT level, D3DLOCKED_RECT *lr, const RECT *rect, DWORD flags) = 0;
     virtual HRESULT __stdcall UnlockRect(D3DCUBEMAP_FACES face, UINT level) = 0;
 };
+struct IDirect3DVertexBuffer9;
+struct IDirect3DIndexBuffer9;
+// Web port extension: the engine locks a whole dynamic buffer (D3DLOCK_DISCARD, offset 0, size 0/total) but only fills a prefix of it. Telling the
+// D3D -> WebGL layer how many bytes were actually written before Unlock() lets it upload just that prefix instead of the whole buffer (the skinned
+// cache alone is 4.5 MB, the pre-tess index buffer 2 MB, the code mesh 0.5 MB: ~7 MB per frame through the browser's GPU process).
+void kisak_buffer_written(IDirect3DVertexBuffer9 *vb, unsigned bytes);
+void kisak_buffer_written(IDirect3DIndexBuffer9 *ib, unsigned bytes);
+
 struct IDirect3DVertexBuffer9 : IDirect3DResource9 {
     virtual HRESULT __stdcall Lock(UINT offset, UINT size, void **data, DWORD flags) = 0;
     virtual HRESULT __stdcall Unlock() = 0;

@@ -23,6 +23,7 @@
 #include <emscripten.h>
 #include <emscripten/html5.h>
 #include "../shim/kvfs.h"
+#include <web_prof.h>
 
 extern char sys_cmdline[1024];
 void Sys_FindInfo();
@@ -45,16 +46,20 @@ static void SeedDefaultProfile()
 static double g_lastReport = 0;
 static int g_framesAtReport = 0;
 
-static double g_lastFrameMs = 0;
+static double g_lastFrameMs = 0, g_lastFrameStartMs = 0;
 
 extern bool g_webQuitting;   // platform/sys_web.cpp: the engine has quit (Quit in the menu / the quit command)
 
 static void FrameCb(void *)
 {
     if (g_webQuitting) return;
+    double t0 = emscripten_get_now();
+    double interval = g_lastFrameStartMs > 0 ? t0 - g_lastFrameStartMs : 0;
+    g_lastFrameStartMs = t0;
     Com_Frame();
     ++g_frames;
     double now = emscripten_get_now();
+    if (webprof::g_on) webprof::FrameEnd(now - t0, interval);
     g_lastFrameMs = now;
     if (now - g_lastReport > 5000.0) {
         if (g_lastReport > 0)
@@ -92,16 +97,24 @@ int main(int argc, char **argv)
                      " +set ui_netSource 0 +set ui_browserShowPure 0 +set ui_browserMod -1"
                      " +set sv_connectTimeout 1800 +set cl_connectTimeout 3600";
     bool autoProfile = true;
+    bool profOn = false; double profHitch = 60.0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--no-profile")) { autoProfile = false; continue; }
         if (!strcmp(argv[i], "--trace-fs")) { setenv("KISAK_TRACE_FS", "1", 1); continue; }
         if (!strcmp(argv[i], "--nosound")) { setenv("KISAK_NOAUDIO", "1", 1); continue; }
         if (!strcmp(argv[i], "--gldebug")) { setenv("KISAK_GLDEBUG", "1", 1); continue; }
+        // --prof: per-zone timings, GL-layer counters, GPU frame time and a dump of every slow frame, in the page log every 4 s ([prof] lines).
+        // --prof-sync also glFinish()es every frame so "gl:finish(gpu wait)" shows how long the CPU waits for the GPU. --prof-hitch=N sets the slow-frame threshold (ms).
+        if (!strcmp(argv[i], "--noidxstream")) { setenv("KISAK_NOIDXSTREAM", "1", 1); continue; }   // debugging: update dynamic index buffers in place (slow, see gfx/d3d9_gl_resources.cpp)
+        if (!strcmp(argv[i], "--prof")) { profOn = true; continue; }
+        if (!strcmp(argv[i], "--prof-sync")) { profOn = true; setenv("KISAK_PROFSYNC", "1", 1); continue; }
+        if (!strncmp(argv[i], "--prof-hitch=", 13)) { profHitch = atof(argv[i] + 13); continue; }
         if (!strcmp(argv[i], "--fsstats")) { setenv("KISAK_FSSTATS", "1", 1); continue; }
         if (!strcmp(argv[i], "--fstrace")) { setenv("KISAK_FSSTATS", "2", 1); continue; }   // log game-data request statistics every 5 s
         strncat(cmd, " ", sizeof cmd - strlen(cmd) - 1);
         strncat(cmd, argv[i], sizeof cmd - strlen(cmd) - 1);
     }
+    if (profOn) webprof::Init(profHitch);
     I_strncpyz(sys_cmdline, cmd, 1024);
     Sys_Milliseconds();
     Profile_Init();

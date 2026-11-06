@@ -15,7 +15,7 @@ the engine sources under `src/` carry only small patches (see `git diff`).
   No GL errors with `?args=--gldebug`.
 - **M2 (done):** playable offline. `?args=%2Bdevmap%20mp_crash` loads the real `mp_crash` map, runs the real GSC scripts, shows the
   loading screen, the team/class menus and drops you into first person (M16A4 viewmodel, HUD, minimap); keyboard + mouse work
-  (`platform/input_web.cpp`), ~45 fps in game, 0 GL errors. A "Player" profile is pre-seeded so you skip the profile screen.
+  (`platform/input_web.cpp`), ~45 fps in game at the time (see Performance for the current numbers), 0 GL errors. A "Player" profile is pre-seeded so you skip the profile screen.
 - **M3 (done):** sound. `audio/al_web.cpp` implements the OpenAL subset the engine's sound driver uses (buffers, static + queued/streaming
   sources, looping, pitch, gain, L/R pan from the source position, soft limiter) as a mixer on its own pthread, writing 48 kHz stereo
   into a ring buffer in shared wasm memory; `app/audio-worklet.js` (an AudioWorklet) plays it. Emscripten's own OpenAL can't be used:
@@ -27,8 +27,7 @@ the engine sources under `src/` carry only small patches (see `git diff`).
   hosting tab and a joining tab. Hosting is "Start New Server" in the menu, joining is the in-game server browser (source Local). `run.sh --lan`
   opens it to other computers on your network. See "Multiplayer" below.
 - **Next:** make it public (relay on a server, signed identities, a dedicated server build instead of a hosting tab), persistence of
-  profile/config, performance of menus. Known rough edges: no reverb/EQ (EFX is stubbed), no HRTF/3D beyond left-right pan, menu frames
-  are slow (~12 fps, blur passes), the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour
+  profile/config, a warm shader list. Known rough edges: no reverb/EQ (EFX is stubbed), no HRTF/3D beyond left-right pan, the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour
   fallback, occlusion queries report 0, Bink is a stub, profiles are saved per browser only (see Profiles), no gamepad, no voice chat.
 
 ## Build & run (needs emscripten, python3)
@@ -69,6 +68,53 @@ URL options: `?args=--nosound` (skip the audio mixer), `?args=--gldebug` (check 
 `?args=%2Bset%20developer%200`. The dev server (`web/tools/serve.py`) adds the COOP/COEP headers that wasm threads need
 and serves the install dir read-only under `/data/` (never copied or uploaded).
 
+
+## Performance
+The first browser builds ran at 12-20 fps on an M1 and 12-60 fps on an M5 Max (menus ~12, fire / smoke / shooting worst). Nothing was wrong with the engine
+code: the time went into the browser's **GPU process**, which executes every GL call the engine thread issues (WebGL commands are asynchronous, but a
+single thread's worth of ANGLE work per frame). Same scene (mp_crash, 1,620 draws, sun shadow + float-z passes), M5 Max, 1024x768:
+29 fps -> 113 fps with the profiler on and `com_maxfps 0`, and vsync-limited (120 fps) with the profiler off; main menu 12 -> 88 fps (the engine's `com_maxfps 85` cap).
+Measured on an M5 Max only: no M1 was available, expect lower absolute numbers there.
+
+**What was wrong, in order of impact**
+1. **Index-buffer updates between draws** (`gfx/d3d9_gl_resources.cpp`, `IndexBuffer::resolve`). The engine writes every batch of the dynamic index ring as
+   Lock / memcpy / Unlock / DrawIndexedPrimitive (~80 per frame in the test scene, more with particle effects). Doing that as
+   `glBufferSubData` into one big `GL_ELEMENT_ARRAY_BUFFER` costs **200-450 us per call** in Chrome on macOS, whatever the size (measured with a stand-alone
+   WebGL microbenchmark: 1000 draws with a 300-byte update each = 455 ms/frame into a 2 MB ring, 198 ms into a 16 KB one, 9-15 ms when every update goes to a
+   different small buffer). Fix: a D3DUSAGE_DYNAMIC index buffer only keeps its CPU copy; at draw time the bytes the draw reads are uploaded (the whole pending
+   dirty range when it covers them) into the next of 256 pooled GL buffers with `glBufferData`, and the segment is remembered for further draws.
+   This alone was 28 -> 86 fps (under the engine's 85 fps cap). Effect-heavy views use more batches, which fits them being the worst case. `--noidxstream` restores the old behaviour for comparison.
+2. **Whole-buffer uploads**: the skinned-model cache (4.5 MB), the pre-tessellated world index buffer (2 MB) and the code mesh (0.5 MB) are locked in full every frame
+   but only a prefix is filled, so ~7.5 MB per frame went through the command buffer. The three engine call sites (`r_model.cpp`, `r_pretess.cpp`, `r_drawsurf.cpp`,
+   `#ifdef KISAK_WEB`) now call `kisak_buffer_written(buffer, usedBytes)` before Unlock (declared in `shim/d3d9.h`) so only the used part is uploaded (7.5 -> 0.9 MB).
+3. **A blocking present**: Emscripten's `emscripten_webgl_commit_frame()` (renderViaOffscreenBackBuffer) blitted a second time inside `gl.getParameter()` calls, which are
+   synchronous round trips that wait for the GPU process to drain the whole frame (20-60 ms stalls in "gl:commit"). The context now renders straight to the
+   OffscreenCanvas (our own backbuffer FBO is blitted to the default framebuffer, the browser presents it when the frame task ends).
+4. **Redundant GL calls**: every draw re-bound every texture (plus a scratch-unit bind in `TexCore::ensureGL`), every sampler, every vertex attribute (bind buffer + pointer + enable)
+   and the constant buffers. Now: bind caches for textures / samplers / array + element buffers (`g_bind`, `BindBufferCached`), a per-location vertex attribute cache, constants
+   that did not change are not re-sent (`TrimUnchanged`), clean buffers/textures return without touching GL, the two constant buffers stay bound to their own targets.
+   (texture binds 2,500 -> 1,080 per frame, vertex attribute setup 3,400 -> 2,800 calls plus the redundant buffer binds / enables per attribute.) Worth little on its own once 1-3
+   were fixed, but it keeps the GPU process lighter, which should matter most on slower Macs.
+5. **Build flags**: the engine was compiled at `-O1` and linked with `-sASSERTIONS=1`, which links Emscripten's *debug* libc / libc++ / dlmalloc (`-DDLMALLOC_DEBUG`:
+   a heap consistency check on every malloc / free). Now `-O2` objects, a `-O2` link and assertions off (JS glue 364 KB -> 171 KB, wasm 5.7 -> 4.7 MB). `KISAK_OPT=O1`,
+   `KISAK_LINK_OPT=O1`, `KISAK_ASSERTIONS=1` (and `build.py --force`) bring the old behaviour back for debugging.
+
+**What is still expensive (not changed)**: the scene is drawn up to three times: the sun shadow map (~390 draws), the **float-z pass** (~470 draws, only when a visible
+particle material is soft-edged, i.e. fire / smoke; `r_zFeather 0` removes it and the soft edges, `+set r_zFeather 0` in `?args=`, latched at material load) and the
+main scene (~760). `+set sm_enable 0` drops the sun shadow pass at any time. Draw calls are the cost unit in this browser path (~5-15 us each in the GPU process),
+not triangles or pixels (3 indices per draw and a 1x1 viewport left the frame time unchanged).
+
+**Profiling** (`?args=--prof`, add `+set com_maxfps 0` to see the uncapped frame time): the page log gets a `[prof]` report every 4 s with the heaviest zones (every engine
+`PROF_SCOPED` span, plus `gl:*` spans of the D3D -> GL layer), per-frame counters (draws, state changes, uploads, draws / triangles / GPU ms per render target: `dr[1024x768 f21]`
+is the main scene, `f114` = R32F: shadow map 1024x2048 and float-z 1024x768), a per-buffer upload table, and a `HITCH` line for every frame over 60 ms (`--prof-hitch=N`).
+`--prof-sync` adds a `glFinish` per frame (`gl:finish(gpu wait)`). The profiler costs ~3 ms per frame itself (a timer pair per zone), so compare runs with it on or off,
+not across. `web/shim/web_prof.h` / `platform/web_prof.cpp`. The console command `gfxexp <mask>` skips a class of GL work to measure it (1 = draws, 2 = constants, 4 = attribute
+pointers, 8 = texture binds, 16 / 256 / 512 / 1024 / 2048 = buffer uploads (all / index / vertex / >= 2 MB / < 2 MB), 32 = 3 indices per draw, 64 = 1x1 viewport).
+`tools/pane_console.js` (paste it into the page) drives the console from JavaScript (`await typeCmd('/setviewpos 440 300 165 85')`) and reads the report (`profLast()`), which is how
+the numbers above were taken: noclip to mp_crash's burning helicopter (fires at ~(430..870, 380..650, 150)), same view for every run.
+
+**Known remaining hitches**: the first use of a shader pair links a GL program synchronously (~3-4 ms each; ~60 at once when a map starts, 10-50 ms stalls when a new effect first
+appears). `KHR_parallel_shader_compile` plus a recorded warm list of (vertex, pixel) shader pairs per map would remove these. A server snapshot after a teleport can take 300+ ms.
 
 ## Profiles (saved in the browser)
 The engine's player profiles are files under `<install root>/players/`: `profiles/active.txt` (the profile in use), and per profile `config_mp.cfg`
@@ -238,6 +284,20 @@ and a cold *joiner* (own origin, own cache) **117 s -> 26 s**. What changed:
 - `build.py` has no header dependency scanning for engine files (use `--force` after touching `shim/*.h`); web-only sources are rebuilt
   automatically when any header under `web/` changes.
 - WebGL needs all framebuffer attachments the same size; D3D9 allows a larger depth buffer (substitute depth renderbuffers).
+
+## Joining a game crashed in the material sort (fixed)
+Symptom: a client joining a LAN game sat on the loading screen forever; its page log had `worker sent an error ... RuntimeError: memory access out of bounds` and the stack ended in
+`Material_Compare` called from `std::sort` (`Material_SortInternal`, run by `R_BeginFrame` once the world is set). The host never crashed and the crash came and went with
+unrelated changes (printing something before the sort hid it), which is the signature of an uninitialised read. Cause: a decompilation bug in `R_RegisterShaderConst`
+(`gfx_d3d/r_material_load_obj.cpp`): its insertion loop compared `*(&consts->count + sortedIndex + 1)`, a 32-bit read stepping from the `count` field, instead of the 16-bit
+`consts->dest[sortedIndex - 1]`, i.e. it compared against uninitialised stack. The pixel literal constants of a material came out in a random order, `Material_Compare` (which
+compares them) stopped being a strict weak ordering (it answered `a<b` and `b<a` for a pair of materials), and libc++'s `std::sort` walked past the end of the array. What the
+stack held depended on what ran earlier, so any change that moves stack contents (new frame layout, profiler zones, build flags) could expose it, and it only showed on a joining
+client. Fixed in the loop (a plain ascending insertion). How it was found: forwarding the worker's stack to the page log (a `self.addEventListener('error', ...)` that posts
+`{cmd: 9, handler: 'printErr', args: [stack]}` to the main thread, prepended to `build/app/index.js`: workers only report `message`, no stack), replaying `std::sort` on a copy of the
+array with a comparator that validated its arguments (it was handed `0`, `0x9d1`, `0x27082a38`), then checking `comp(a,b) && comp(b,a)` for the pairs it saw.
+Test it with two tabs: host `?autostart&args=%2Bdevmap%20mp_crash`, join from `http://127.0.0.1:8080/?autostart&args=%2Bconnect%2010.77.0.N` (N = the host's address in its log; the
+127.0.0.1 origin has its own cache, so it behaves like another computer).
 
 ## Platform-assumption audit (MSVC/x86 → clang/wasm32)
 After the `rand()` bug, the whole engine was audited for other places where decompiled MSVC-era code silently assumes its original platform.

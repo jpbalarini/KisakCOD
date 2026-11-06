@@ -60,6 +60,9 @@ void __cdecl R_UnlockSkinnedCache()
         PROF_SCOPED("UnlockSkinnedCache");
         vb = frontEndDataOut->skinnedCacheVb->buffer;
         iassert( vb );
+#ifdef KISAK_WEB
+        kisak_buffer_written(vb, frontEndDataOut->skinnedCacheVb->used);   // whole 4.5MB buffer is locked, only `used` bytes were filled
+#endif
         R_UnlockVertexBuffer(vb);
     }
 }

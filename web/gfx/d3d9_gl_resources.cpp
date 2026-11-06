@@ -1,10 +1,12 @@
 // d3d9_gl_resources.cpp -- textures, surfaces, buffers, declarations, shaders and queries of the D3D9 -> WebGL2 device.
 #include "d3d9_gl_internal.h"
+#include <web_prof.h>
 
 #include <emscripten/html5.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 
 namespace d3dgl {
 
@@ -21,6 +23,7 @@ static std::mutex g_delMutex;
 static std::vector<GLuint> g_delIds[4];
 static std::vector<uint32_t> g_delSurfaces;
 static std::atomic<bool> g_delPending{false};
+BindCache g_bind;
 void DeferDelete(int kind, GLuint id) { if (!id) return; std::lock_guard<std::mutex> g(g_delMutex); g_delIds[kind].push_back(id); g_delPending = true; }
 void DeferPurgeSurface(uint32_t id) { std::lock_guard<std::mutex> g(g_delMutex); g_delSurfaces.push_back(id); g_delPending = true; }
 void DrainDeferredDeletes()
@@ -29,6 +32,8 @@ void DrainDeferredDeletes()
     std::vector<GLuint> ids[4]; std::vector<uint32_t> surfs;
     { std::lock_guard<std::mutex> g(g_delMutex); for (int i = 0; i < 4; ++i) ids[i].swap(g_delIds[i]); surfs.swap(g_delSurfaces); }
     for (uint32_t s : surfs) PurgeFBOs(s);
+    for (GLuint t : ids[0]) { for (auto &unit : g_bind.tex) for (GLuint &b : unit) if (b == t) b = 0; }
+    for (GLuint b : ids[1]) { if (g_bind.arrayBuf == b) g_bind.arrayBuf = 0; if (g_bind.elemBuf == b) g_bind.elemBuf = 0; }
     if (!ids[0].empty()) glDeleteTextures((GLsizei)ids[0].size(), ids[0].data());
     if (!ids[1].empty()) glDeleteBuffers((GLsizei)ids[1].size(), ids[1].data());
     if (!ids[2].empty()) glDeleteRenderbuffers((GLsizei)ids[2].size(), ids[2].data());
@@ -228,7 +233,7 @@ HRESULT TexCore::lockLevel(int face, UINT level, void **bits, INT *pitch, INT *s
     size_t bytes = LevelBytes(fi, lw, lh, d > 1 ? ld : 1, &p, &sp);
     Level &L = lv[(size_t)face * levels + level];
     if (L.data.size() != bytes) L.data.assign(bytes, 0);
-    if (!readOnly) L.dirty = true;
+    if (!readOnly) { L.dirty = true; uploadPending.store(true, std::memory_order_release); }
     *bits = L.data.data();
     if (pitch) *pitch = (INT)p;
     if (slicePitch) *slicePitch = (INT)sp;
@@ -245,10 +250,13 @@ void TexCore::destroyGL()
 void TexCore::ensureGL()
 {
     // The texture's dirty levels are uploaded on the GL thread; the CPU copy is dropped afterwards unless the texture lives in system memory.
+    if (tex && !uploadPending.load(std::memory_order_acquire)) return;   // fast path: nothing to upload -> no lock, no GL calls
     std::lock_guard<std::mutex> g(lock);
     if (glFailed) return;
     const FmtInfo &fi = GetFmt(fmt);
     if (!fi.valid) { glFailed = true; Log("texture format %d unsupported", (int)fmt); return; }
+    uploadPending.store(false, std::memory_order_relaxed);
+    PROF_SCOPED("gl:texUpload"); WEBPROF_COUNT("texUploads", 1);
     SetScratchUnit();
     if (!tex) {
         glGenTextures(1, &tex);
@@ -283,6 +291,7 @@ void TexCore::ensureGL()
             } else {
                 glTexSubImage2D(tgt, (GLint)level, 0, 0, (GLsizei)lw, (GLsizei)lh, fi.format, fi.type, data);
             }
+            WEBPROF_COUNT("texUpBytes", L.data.size());
             L.dirty = false;
             if (freeAfter) { Bytes().swap(L.data); }
         }
@@ -443,21 +452,57 @@ HRESULT TextureVolume::LockBox(UINT level, D3DLOCKED_BOX *lb, const D3DBOX *, DW
 HRESULT TextureVolume::UnlockBox(UINT level) { core.unlockLevel(0, level); return D3D_OK; }
 
 // ====================================================================== buffers
+// ---- per-buffer upload statistics for the profiler (only filled with ?args=--prof)
+namespace {
+struct BufStat { const void *id = nullptr; size_t size = 0; DWORD usage = 0; GLenum target = 0; double bytes = 0; int uploads = 0; size_t maxChunk = 0; };
+BufStat g_bufStats[64];
+void NoteBufferUpload(const void *id, size_t size, DWORD usage, GLenum target, size_t bytes)
+{
+    BufStat *free_ = nullptr;
+    for (BufStat &b : g_bufStats) { if (b.id == id) { b.bytes += bytes; ++b.uploads; if (bytes > b.maxChunk) b.maxChunk = bytes; return; } if (!b.id && !free_) free_ = &b; }
+    if (free_) { *free_ = BufStat{id, size, usage, target, (double)bytes, 1, bytes}; }
+}
+void ReportBufferUploads()
+{
+    BufStat *top[64]; int n = 0;
+    for (BufStat &b : g_bufStats) if (b.id && b.uploads) top[n++] = &b;
+    std::sort(top, top + n, [](BufStat *a, BufStat *b) { return a->bytes > b->bytes; });
+    fprintf(stderr, "[prof]   buffer uploads per window (top): ");
+    for (int i = 0; i < n && i < 6; ++i)
+        fprintf(stderr, " [%s size=%zuKB usage=0x%x: %d uploads, %.1f MB total, max chunk %zuKB]", top[i]->target == GL_ELEMENT_ARRAY_BUFFER ? "IB" : "VB",
+                top[i]->size / 1024, (unsigned)top[i]->usage, top[i]->uploads, top[i]->bytes / 1048576.0, top[i]->maxChunk / 1024);
+    fprintf(stderr, "\n");
+    for (BufStat &b : g_bufStats) { b.bytes = 0; b.uploads = 0; b.maxChunk = 0; }
+}
+}
+void InstallBufferUploadReport() { webprof::SetExtraReport(ReportBufferUploads); }
+
 void BufferCore::sync()
 {
     std::lock_guard<std::mutex> g(lock);
+    bool dirty = dirtyHi > dirtyLo && dirtyLo != (size_t)-1;
+    if (created && !dirty) return;   // clean: no GL calls (callers bind what they need)
     if (!created) {
         glGenBuffers(1, &buf);
-        glBindBuffer(target, buf);
+        BindBufferCached(target, buf);
         glBufferData(target, (GLsizeiptr)cpu.size(), nullptr, (usage & D3DUSAGE_DYNAMIC) ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
         created = true;
         dirtyLo = 0; dirtyHi = cpu.size();
     } else {
-        glBindBuffer(target, buf);
+        BindBufferCached(target, buf);
     }
     if (dirtyHi > dirtyLo && dirtyLo != (size_t)-1) {
         size_t hi = dirtyHi > cpu.size() ? cpu.size() : dirtyHi;
-        if (hi > dirtyLo) glBufferSubData(target, (GLintptr)dirtyLo, (GLsizeiptr)(hi - dirtyLo), cpu.data() + dirtyLo);
+        if (hi > dirtyLo) {
+            PROF_SCOPED("gl:bufUpload"); WEBPROF_COUNT("bufUploads", 1); WEBPROF_COUNT("bufUpBytes", hi - dirtyLo);
+            if (webprof::g_on) NoteBufferUpload(this, cpu.size(), usage, target, hi - dirtyLo);
+            bool skip = (g_gfxExp & 16) && usage != 0;
+            if ((g_gfxExp & 256) && target == GL_ELEMENT_ARRAY_BUFFER && usage != 0) skip = true;      // experiment: skip index buffer uploads
+            if ((g_gfxExp & 512) && target == GL_ARRAY_BUFFER && usage != 0) skip = true;               // ... vertex buffer uploads
+            if ((g_gfxExp & 1024) && cpu.size() >= (2u << 20) && usage != 0) skip = true;               // ... big (>= 2 MB) buffers
+            if ((g_gfxExp & 2048) && cpu.size() < (2u << 20) && usage != 0) skip = true;                // ... small (< 2 MB) buffers
+            if (!skip) glBufferSubData(target, (GLintptr)dirtyLo, (GLsizeiptr)(hi - dirtyLo), cpu.data() + dirtyLo);
+        }
     }
     dirtyLo = (size_t)-1; dirtyHi = 0;
 }
@@ -478,21 +523,68 @@ HRESULT VertexBuffer::Lock(UINT offset, UINT size, void **data, DWORD flags)
     *data = core.cpu.data() + offset;
     return D3D_OK;
 }
-HRESULT VertexBuffer::Unlock() { if (lockSize) core.touch(lockOffset, (size_t)lockOffset + lockSize); lockSize = 0; return D3D_OK; }
+static void TouchLocked(BufferCore &c, UINT lockOffset, UINT lockSize)
+{
+    size_t hi = (size_t)lockOffset + lockSize;
+    if (c.writtenLimit != (size_t)-1) { if (c.writtenLimit < hi) hi = c.writtenLimit; c.writtenLimit = (size_t)-1; }
+    if (hi > lockOffset) c.touch(lockOffset, hi);
+}
+HRESULT VertexBuffer::Unlock() { if (lockSize) TouchLocked(core, lockOffset, lockSize); lockSize = 0; return D3D_OK; }
 HRESULT VertexBuffer::GetDesc(D3DVERTEXBUFFER_DESC *d)
 { d->Format = D3DFMT_VERTEXDATA; d->Type = D3DRTYPE_VERTEXBUFFER; d->Usage = usage; d->Pool = pool; d->Size = (UINT)core.cpu.size(); d->FVF = fvf; return D3D_OK; }
 
 HRESULT IndexBuffer::GetDevice(IDirect3DDevice9 **out) { *out = DeviceInterface(dev); (*out)->AddRef(); return D3D_OK; }
 IndexBuffer::~IndexBuffer() { core.destroyGL(); }
+// ---- streamed index buffers.
+// Updating an index buffer between draws that read it is extremely slow in the browser's GPU process (measured: 200-450 us per glBufferSubData
+// even for 300 bytes, against ~10 us when every upload goes to a different small buffer), and the engine does exactly that: every batch of
+// the dynamic index ring is Lock / memcpy / Unlock / DrawIndexedPrimitive (~80 per frame). So a streamed (D3DUSAGE_DYNAMIC) index buffer keeps only
+// its CPU copy; at draw time the bytes the draw reads are uploaded (the whole pending dirty range when it covers them: one upload for the
+// ~500 KB pre-tess buffer that many draws read) into the next buffer of a pool and drawn from there. Segments are remembered so further draws
+// that read the same bytes re-use them, and dropped when the bytes are rewritten (touch) or the ring is discarded.
+namespace {
+constexpr int kIdxPool = 256;
+GLuint g_idxPool[kIdxPool];
+uint32_t g_idxPoolGen[kIdxPool];
+int g_idxPoolNext = 0;
+bool g_idxPoolInit = false;
+}
+
+void IndexBuffer::resolve(size_t lo, size_t hi, GLuint *glBuf, size_t *glOffset)
+{
+    std::lock_guard<std::mutex> g(core.lock);
+    for (size_t i = core.segs.size(); i-- > 0;) {
+        const StreamSeg &sg = core.segs[i];
+        if (g_idxPoolGen[sg.slot] != sg.gen) { core.segs.erase(core.segs.begin() + i); continue; }   // pool buffer was recycled
+        if (sg.lo <= lo && hi <= sg.hi) { *glBuf = g_idxPool[sg.slot]; *glOffset = lo - sg.lo; return; }
+    }
+    if (!g_idxPoolInit) { g_idxPoolInit = true; glGenBuffers(kIdxPool, g_idxPool); }
+    size_t size = core.cpu.size(), ulo = lo, uhi = hi > size ? size : hi;
+    bool pending = core.dirtyHi > core.dirtyLo && core.dirtyLo != (size_t)-1;
+    size_t dhi = core.dirtyHi > size ? size : core.dirtyHi;
+    bool coversDirty = pending && core.dirtyLo <= lo && uhi <= dhi;
+    if (coversDirty) { ulo = core.dirtyLo; uhi = dhi; }
+    int slot = g_idxPoolNext; g_idxPoolNext = (g_idxPoolNext + 1) % kIdxPool;
+    ++g_idxPoolGen[slot];
+    PROF_SCOPED("gl:idxStream"); WEBPROF_COUNT("idxStreams", 1); WEBPROF_COUNT("idxStreamBytes", uhi - ulo);
+    BindBufferCached(GL_ELEMENT_ARRAY_BUFFER, g_idxPool[slot]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(uhi - ulo), core.cpu.data() + ulo, GL_STREAM_DRAW);
+    if (coversDirty) { core.dirtyLo = (size_t)-1; core.dirtyHi = 0; }   // the pending writes are now in a segment
+    if (core.segs.size() > 256) core.segs.erase(core.segs.begin(), core.segs.begin() + 128);
+    core.segs.push_back({ulo, uhi, slot, g_idxPoolGen[slot]});
+    *glBuf = g_idxPool[slot]; *glOffset = lo - ulo;
+}
+
 HRESULT IndexBuffer::Lock(UINT offset, UINT size, void **data, DWORD flags)
 {
+    if (flags & D3DLOCK_DISCARD) { std::lock_guard<std::mutex> g(core.lock); core.segs.clear(); }   // the ring wrapped: everything before is garbage
     if (offset > core.cpu.size()) return D3DERR_INVALIDCALL;
     if (!size || offset + size > core.cpu.size()) size = (UINT)core.cpu.size() - offset;
     lockOffset = offset; lockSize = (flags & D3DLOCK_READONLY) ? 0 : size;
     *data = core.cpu.data() + offset;
     return D3D_OK;
 }
-HRESULT IndexBuffer::Unlock() { if (lockSize) core.touch(lockOffset, (size_t)lockOffset + lockSize); lockSize = 0; return D3D_OK; }
+HRESULT IndexBuffer::Unlock() { if (lockSize) TouchLocked(core, lockOffset, lockSize); lockSize = 0; return D3D_OK; }
 HRESULT IndexBuffer::GetDesc(D3DINDEXBUFFER_DESC *d)
 { d->Format = fmt; d->Type = D3DRTYPE_INDEXBUFFER; d->Usage = usage; d->Pool = pool; d->Size = (UINT)core.cpu.size(); return D3D_OK; }
 
@@ -566,3 +658,6 @@ HRESULT Query::GetData(void *data, DWORD size, DWORD)
 }
 
 } // namespace d3dgl
+
+void kisak_buffer_written(IDirect3DVertexBuffer9 *vb, unsigned bytes) { if (vb) static_cast<d3dgl::VertexBuffer *>(vb)->core.writtenLimit = bytes; }
+void kisak_buffer_written(IDirect3DIndexBuffer9 *ib, unsigned bytes) { if (ib) static_cast<d3dgl::IndexBuffer *>(ib)->core.writtenLimit = bytes; }

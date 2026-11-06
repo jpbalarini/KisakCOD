@@ -164,6 +164,9 @@ void R_EndMeshVerts(GfxMeshData* mesh)
 {
     if (mesh->vb.verts)
     {
+#ifdef KISAK_WEB
+        kisak_buffer_written(mesh->vb.buffer, mesh->vb.used);   // whole mesh buffer locked, `used` bytes filled
+#endif
         R_UnlockVertexBuffer(mesh->vb.buffer);
         mesh->vb.verts = 0;
     }
