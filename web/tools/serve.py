@@ -340,6 +340,7 @@ def main():
     ap.add_argument("--data", default=os.environ.get("KISAK_INSTALL_PATH", ""))
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--relay-port", type=int, default=8081, help="multiplayer relay port (0 disables it)")
+    ap.add_argument("--net-stats", action="store_true", help="relay: ping every player once a second and print its network round trip every 5 s (diagnoses ping)")
     ap.add_argument("--lan", action="store_true", help="listen on all interfaces so other devices on the network can connect")
     ap.add_argument("--tls-cert", help="serve https/wss with this certificate (PEM)")
     ap.add_argument("--tls-key", help="private key for --tls-cert (PEM)")
@@ -363,7 +364,7 @@ def main():
     import relay
     ssl_ctx = relay.make_ssl_context(ARGS.tls_cert, ARGS.tls_key) if ARGS.tls_cert else None
     if ARGS.relay_port:
-        relay.start_in_thread(bind, ARGS.relay_port, ARGS.verbose, ARGS.allow_origin, ARGS.lan, ssl_ctx)
+        relay.start_in_thread(bind, ARGS.relay_port, ARGS.verbose, ARGS.allow_origin, ARGS.lan, ssl_ctx, ARGS.net_stats)
     httpd = Server((bind, ARGS.port), Handler)
     if ssl_ctx:
         # handshake lazily in the per-connection handler thread so one stalled client cannot block accept()

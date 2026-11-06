@@ -28,11 +28,13 @@ void Web_RegisterCommands();   // devcmds_web.cpp
 // Keep the connection to `url` alive (retry every 3 s); an empty url disables networking. Returns 0 = idle, 1 = connecting, 2 = up (virtual
 // address assigned).
 EM_JS(int, kn_service, (const char *urlPtr), {
-    const S = (globalThis.__kn = globalThis.__kn || { ws: null, q: [], ip: null, port: 28960, url: null, retryAt: 0, dropped: 0 });
+    const S = (globalThis.__kn = globalThis.__kn || { ws: null, q: [], qt: [], ip: null, port: 28960, url: null, retryAt: 0, dropped: 0, lastConsume: 0,
+                                                       echoOn: false, echoAt: 0,
+                                                       st: { n: 0, dwell: 0, dwellMax: 0, turnN: 0, turn: 0, turnMax: 0, tx: 0, rttN: 0, rtt: 0, rttMax: 0, rttSlow: 0 } });
     const url = UTF8ToString(urlPtr);
     if (S.url !== url) {
         if (S.ws) { try { S.ws.close(); } catch (e) {} S.ws = null; }
-        S.url = url; S.ip = null; S.q.length = 0; S.retryAt = 0;
+        S.url = url; S.ip = null; S.q.length = 0; S.qt.length = 0; S.retryAt = 0;
     }
     if (!url) return 0;
     if (!S.ws && Date.now() >= S.retryAt) {
@@ -52,8 +54,16 @@ EM_JS(int, kn_service, (const char *urlPtr), {
                 }
                 const b = new Uint8Array(ev.data);
                 if (b.length < 6) return;
+                if (b.length === 22 && b[6] === 0x4B && b[7] === 0x4E && b[8] === 0x45 && b[9] === 0x43 && b[10] === 0x48 && b[11] === 0x4F && b[12] === 0x30 && b[13] === 0x31) {
+                    // "KNECHO01" + sender's timestamp, sent by kn_echo to 127.0.0.1 (= the relay hands it straight back): the wire round trip, measured here in
+                    // the message handler so the engine's frame loop is not part of it (the handler runs between frames).
+                    const d = performance.now() - new DataView(ev.data).getFloat64(14, true), st = S.st;
+                    st.rttN++; st.rtt += d; if (d > st.rttMax) st.rttMax = d; if (d > 100) st.rttSlow++;
+                    return;
+                }
                 if (S.q.length >= 1024) { S.dropped++; return; }
                 S.q.push(b);
+                S.qt.push(performance.now());   // arrival time: how long the packet waits for the engine's next frame is part of every ping
             };
             ws.onclose = function () { if (S.ws === ws) { S.ws = null; S.ip = null; } };
             ws.onerror = function () {};
@@ -68,6 +78,10 @@ EM_JS(int, kn_recv, (uint8_t *dst, int maxLen, uint8_t *fromIp, uint8_t *fromPor
     const S = globalThis.__kn;
     if (!S || !S.q.length) return -1;
     const b = S.q.shift();
+    const now = performance.now();
+    const d = now - S.qt.shift();
+    S.st.n++; S.st.dwell += d; if (d > S.st.dwellMax) S.st.dwellMax = d;
+    S.lastConsume = now;
     const n = b.length - 6;
     if (n > maxLen) return -2;
     HEAPU8.set(b.subarray(0, 4), fromIp);
@@ -82,6 +96,12 @@ EM_JS(int, kn_send, (const uint8_t *data, int len, const uint8_t *ip, const uint
     const S = globalThis.__kn;
     if (!S || !S.ws || S.ws.readyState !== 1 || !S.ip) return 0;
     if (S.ws.bufferedAmount > (1 << 20)) return 0;
+    S.st.tx++;
+    if (S.lastConsume) {   // first send after a receive = how long the engine took to react (client: snapshot -> next usercmd; host: usercmd -> snapshot)
+        const d = performance.now() - S.lastConsume;
+        S.st.turnN++; S.st.turn += d; if (d > S.st.turnMax) S.st.turnMax = d;
+        S.lastConsume = 0;
+    }
     const f = new Uint8Array(6 + len);
     f.set(HEAPU8.subarray(ip, ip + 4), 0);
     f[4] = HEAPU8[port];
@@ -91,12 +111,42 @@ EM_JS(int, kn_send, (const uint8_t *data, int len, const uint8_t *ip, const uint
     return 1;
 });
 
+// net_stats: once a second send a timestamped datagram to 127.0.0.1 (the relay loops those back to the sender) to time the wire round trip.
+EM_JS(void, kn_echo, (int on), {
+    const S = globalThis.__kn;
+    if (!S) return;
+    S.echoOn = !!on;
+    if (!on || !S.ws || S.ws.readyState !== 1 || !S.ip) return;
+    const now = performance.now();
+    if (now - S.echoAt < 1000) return;
+    S.echoAt = now;
+    const f = new Uint8Array(22), v = new DataView(f.buffer);
+    f.set([127, 0, 0, 1, (S.port >> 8) & 255, S.port & 255, 0x4B, 0x4E, 0x45, 0x43, 0x48, 0x4F, 0x30, 0x31], 0);   // "KNECHO01"
+    v.setFloat64(14, now, true);
+    S.ws.send(f);
+});
+
 EM_JS(void, kn_local_address, (uint8_t *ip, uint8_t *port), {
     const S = globalThis.__kn;
     if (!S || !S.ip) return;
     HEAPU8.set(S.ip, ip);
     HEAPU8[port] = (S.port >> 8) & 255;
     HEAPU8[port + 1] = S.port & 255;
+});
+
+// Format and reset the counters kept above: packets received/sent per second, the time received packets waited in the browser's queue until the
+// engine polled (dwell), the engine's reaction time. Returns the number of packets received.
+EM_JS(int, kn_stats_take, (char *out, int outLen, double seconds), {
+    const S = globalThis.__kn;
+    if (!S) { stringToUTF8("", out, outLen); return 0; }
+    const t = S.st, f = (v) => v.toFixed(1);
+    const rx = t.n;
+    stringToUTF8("rx " + (rx / seconds).toFixed(0) + "/s tx " + (t.tx / seconds).toFixed(0) + "/s | queue wait avg " + f(rx ? t.dwell / rx : 0) + " max " + f(t.dwellMax) +
+                 " ms | reaction avg " + f(t.turnN ? t.turn / t.turnN : 0) + " max " + f(t.turnMax) + " ms" +
+                 (S.echoOn ? " | wire rtt " + (t.rttN ? "avg " + f(t.rtt / t.rttN) + " max " + f(t.rttMax) + " ms (" + t.rttN + " pings, " + t.rttSlow + " >100 ms)" : "NO REPLY (stalled link?)") : "") +
+                 (S.dropped ? " | queue overflow drops " + S.dropped : ""), out, outLen);
+    S.st = { n: 0, dwell: 0, dwellMax: 0, turnN: 0, turn: 0, turnMax: 0, tx: 0, rttN: 0, rtt: 0, rttMax: 0, rttSlow: 0 };
+    return rx;
 });
 
 // "auto" -> ws(s)://<host the page was served from>:8081/
@@ -136,10 +186,43 @@ static void NetService()
     }
 }
 
+// net_stats 1: every 5 s one "[net]" line in the page log -- frame period of this tab, and how long packets sat in the browser's queue waiting
+// for the engine to poll them. The scoreboard ping is the server's snapshot -> usercmd-ack time: it contains the host's frame period, the
+// client's frame period and the transport, so this shows which of them is large. (The relay's `--net-stats` shows the transport on its own.)
+static const dvar_s *net_stats;
+static int s_statFrame = -1;
+static double s_statT0 = 0, s_statLastFrame = 0, s_gapSum = 0, s_gapMax = 0;
+static int s_gapN = 0;
+
+static void NetStats()
+{
+    if (!net_stats || !net_stats->current.enabled) { s_statT0 = 0; return; }
+    kn_echo(1);
+    const double now = emscripten_get_now();
+    char line[400];
+    if (s_statT0 == 0) {
+        s_statT0 = s_statLastFrame = now; s_statFrame = com_frameNumber; s_gapSum = s_gapMax = 0; s_gapN = 0;
+        kn_stats_take(line, sizeof line, 1);   // reset the JS counters
+        return;
+    }
+    if (com_frameNumber != s_statFrame) {      // first poll of a new frame = the frame's start
+        const double gap = now - s_statLastFrame;
+        s_gapSum += gap; ++s_gapN; if (gap > s_gapMax) s_gapMax = gap;
+        s_statFrame = com_frameNumber; s_statLastFrame = now;
+    }
+    if (now - s_statT0 >= 5000.0) {
+        kn_stats_take(line, sizeof line, (now - s_statT0) / 1000.0);
+        const double avg = s_gapN ? s_gapSum / s_gapN : 0;
+        fprintf(stderr, "[net] frame period avg %.1f max %.0f ms (%.0f fps) | %s\n", avg, s_gapMax, avg > 0 ? 1000.0 / avg : 0, line);
+        s_statT0 = now; s_gapSum = s_gapMax = 0; s_gapN = 0;
+    }
+}
+
 void NET_Init(void)
 {
     Web_RegisterCommands();   // NET_Init runs inside Com_Init after Cmd_Init but before the startup +commands execute
     net_relay = Dvar_RegisterString("net_relay", "auto", DVAR_ARCHIVE, "WebSocket relay used instead of UDP ('auto' = same host, port 8081; empty = offline)");
+    net_stats = Dvar_RegisterBool("net_stats", false, 0, "print a [net] line every 5 s: frame period and how long packets wait for the engine (diagnoses ping)");
     NetService();
 }
 
@@ -154,6 +237,7 @@ uint32_t __cdecl NET_TCPIPSocket(const char *, int, int) { return (uint32_t)-1; 
 qboolean Sys_GetPacket(netadr_t *net_from, msg_t *net_message)
 {
     NetService();
+    NetStats();
     for (;;) {
         int n = kn_recv(net_message->data, net_message->maxsize, net_from->ip, (uint8_t *)&net_from->port);
         if (n == -1) return 0;

@@ -58,6 +58,8 @@ class Client:
         self.window = int(time.time())
         self.count = 0
         self.rx = self.tx = self.dropped = 0
+        self.rtts = []                    # WebSocket ping->pong round trips (ms) since the last --stats report
+        self.mark = (0, 0)                # (rx, tx) at the last report
 
     @property
     def name(self):
@@ -65,11 +67,34 @@ class Client:
 
 
 class Relay:
-    def __init__(self, verbose=False, allow_origins=None, lan=False):
+    def __init__(self, verbose=False, allow_origins=None, lan=False, stats=False):
         self.clients = {}                 # ip bytes -> Client
         self.verbose = verbose
         self.allow_origins = set(allow_origins or [])
         self.lan = lan                    # also accept pages served from private-network addresses
+        self.stats = stats                # --stats: ping every client once a second and print the round trips every 5 s
+
+    async def _pinger(self, client):
+        """WebSocket ping every second. The browser answers it without the engine's help, but only while the page's thread is free: a pong
+        time = Wi-Fi + TCP (a lost packet stalls the stream until it is retransmitted) + this relay + how long the tab's event loop was busy
+        (a blocked engine frame / a hidden tab's slow loop show up here too). Seconds-long pongs = the page was frozen (loading a map)."""
+        try:
+            while True:
+                client.writer.write(self.frame(9, struct.pack(">d", time.monotonic())))
+                await asyncio.sleep(1.0)
+        except Exception:
+            pass
+
+    async def _reporter(self):
+        while True:
+            await asyncio.sleep(5.0)
+            for c in list(self.clients.values()):
+                rx, tx = c.rx - c.mark[0], c.tx - c.mark[1]
+                c.mark = (c.rx, c.tx)
+                r, c.rtts = c.rtts, []
+                rtt = (f"rtt avg {sum(r) / len(r):5.1f} ms  max {max(r):5.1f} ms  min {min(r):5.1f} ms  ({len(r)} pings)" if r
+                       else "rtt: no pong (page frozen? connection stalled?)")
+                print(f"[relay] {c.name} ({c.peer[0]}): {rtt}   from client {rx / 5:.0f}/s, to client {tx / 5:.0f}/s", flush=True)
 
     def _alloc_ip(self):
         for n in range(1, 65535):
@@ -116,6 +141,7 @@ class Relay:
     async def handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
         client = None
+        pinger = None
         try:
             request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
             lines = request.decode("latin1").split("\r\n")
@@ -143,6 +169,8 @@ class Relay:
             print(f"[relay] {client.name} connected from {peer[0]}:{peer[1]} ({len(self.clients)} online)", flush=True)
             writer.write(self.frame(1, json.dumps({"ip": client.name, "port": GAME_PORT}).encode()))
             await writer.drain()
+            if self.stats:
+                pinger = asyncio.ensure_future(self._pinger(client))
 
             message = b""
             while True:
@@ -154,6 +182,8 @@ class Relay:
                     writer.write(self.frame(10, data))
                     continue
                 if opcode == 10:
+                    if len(data) == 8:
+                        client.rtts.append((time.monotonic() - struct.unpack(">d", data)[0]) * 1000.0)
                     continue
                 if opcode in (1, 2, 0):
                     message += data
@@ -166,6 +196,8 @@ class Relay:
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError, ValueError):
             pass
         finally:
+            if pinger is not None:
+                pinger.cancel()
             if client is not None:
                 self.clients.pop(client.ip, None)
                 print(f"[relay] {client.name} disconnected (rx {client.rx} tx {client.tx} dropped {client.dropped}, {len(self.clients)} online)", flush=True)
@@ -206,18 +238,20 @@ class Relay:
     async def serve(self, host, port, ssl_ctx=None):
         server = await asyncio.start_server(self.handle, host, port, ssl=ssl_ctx)
         print(f"[relay] virtual LAN switch on {'wss' if ssl_ctx else 'ws'}://{host}:{port}/ (addresses 10.77.x.y:{GAME_PORT})", flush=True)
+        if self.stats:
+            asyncio.ensure_future(self._reporter())
         async with server:
             await server.serve_forever()
 
 
-def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=None, lan=False, ssl_ctx=None):
+def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=None, lan=False, ssl_ctx=None, stats=False):
     """Run the relay on its own event loop in a daemon thread (used by serve.py)."""
     ready = threading.Event()
 
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        relay = Relay(verbose, allow_origins, lan)
+        relay = Relay(verbose, allow_origins, lan, stats)
 
         async def main():
             try:
@@ -227,6 +261,8 @@ def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=No
                 ready.set()
                 return
             print(f"[relay] virtual LAN switch on {'wss' if ssl_ctx else 'ws'}://{host}:{port}/ (addresses 10.77.x.y:{GAME_PORT})", flush=True)
+            if stats:
+                asyncio.ensure_future(relay._reporter())
             ready.set()
             async with server:
                 await server.serve_forever()
@@ -345,6 +381,7 @@ def main():
     ap.add_argument("--host", default=None, help="interface to listen on (default 127.0.0.1, or 0.0.0.0 with --lan)")
     ap.add_argument("--port", type=int, default=8081)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--stats", action="store_true", help="ping every client once a second and print each one's transport round trip + packet rates every 5 s")
     ap.add_argument("--lan", action="store_true", help="listen on all interfaces and accept pages served from private-network addresses")
     ap.add_argument("--allow-origin", action="append", default=[], help="additional page origin/host allowed to connect")
     ap.add_argument("--tls-cert", help="serve wss:// with this certificate (needed when the pages are served over https)")
@@ -356,7 +393,7 @@ def main():
         return
     ssl_ctx = make_ssl_context(args.tls_cert, args.tls_key) if args.tls_cert else None
     try:
-        asyncio.run(Relay(args.verbose, args.allow_origin, args.lan).serve(args.host or ("0.0.0.0" if args.lan else "127.0.0.1"), args.port, ssl_ctx))
+        asyncio.run(Relay(args.verbose, args.allow_origin, args.lan, args.stats).serve(args.host or ("0.0.0.0" if args.lan else "127.0.0.1"), args.port, ssl_ctx))
     except KeyboardInterrupt:
         pass
 

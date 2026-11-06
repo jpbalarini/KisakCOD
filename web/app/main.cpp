@@ -99,7 +99,7 @@ int main(int argc, char **argv)
                      " +set ui_netSource 0 +set ui_browserShowPure 0 +set ui_browserMod -1"
                      " +set sv_connectTimeout 1800 +set cl_connectTimeout 3600";
     bool autoProfile = true;
-    bool profOn = false; double profHitch = 60.0;
+    bool profOn = false, simHidden = false; double profHitch = 60.0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--no-profile")) { autoProfile = false; continue; }
         if (!strcmp(argv[i], "--trace-fs")) { setenv("KISAK_TRACE_FS", "1", 1); continue; }
@@ -111,6 +111,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--prof")) { profOn = true; continue; }
         if (!strcmp(argv[i], "--prof-sync")) { profOn = true; setenv("KISAK_PROFSYNC", "1", 1); continue; }
         if (!strncmp(argv[i], "--prof-hitch=", 13)) { profHitch = atof(argv[i] + 13); continue; }
+        if (!strcmp(argv[i], "--sim-hidden")) { simHidden = true; continue; }   // test aid: never start the rAF loop = how a hidden tab runs (watchdog frames only)
         if (!strcmp(argv[i], "--fsstats")) { setenv("KISAK_FSSTATS", "1", 1); continue; }
         if (!strcmp(argv[i], "--fstrace")) { setenv("KISAK_FSSTATS", "2", 1); continue; }   // log game-data request statistics every 5 s
         // --view=WxH: the size (CSS px) of the area the page shows the game in, measured by the page when Start was pressed, so the very first
@@ -137,9 +138,12 @@ int main(int argc, char **argv)
     // No mpdata file exists, so this takes the "no stats found" path: default class slots, unlocks, stat version.
     if (autoProfile) LiveStorage_ReadStats();
     fprintf(stderr, "[web] Com_Init done, entering frame loop\n");
-    emscripten_set_main_loop_arg(FrameCb, nullptr, 0, 0);
-    // requestAnimationFrame stops in a hidden tab, which would freeze a game server hosted there (its players time out). Worker timers are not
-    // throttled by tab visibility, so a watchdog runs a frame (~20 Hz) whenever the rAF loop has not produced one recently.
-    emscripten_set_interval([](void *) { if (emscripten_get_now() - g_lastFrameMs > 100.0) FrameCb(nullptr); }, 50.0, nullptr);
+    if (!simHidden) emscripten_set_main_loop_arg(FrameCb, nullptr, 0, 0);
+    // requestAnimationFrame stops in a hidden tab (another tab in front, window covered or minimised), which would freeze a game server hosted
+    // there (its players time out) and, for a player, make every packet wait for the next frame. Worker timers are not throttled by tab
+    // visibility, so a watchdog runs a frame whenever the rAF loop has been idle for 30 ms: a visible tab (rAF every 8-16 ms) never trips it, a
+    // hidden one runs at ~25-30 fps. (It used to check every 50 ms for a 100 ms gap = one frame per 150 ms = 6.7 fps: every ping in the game
+    // that involved a hidden tab was 150+ ms.) The gap is measured from the end of the last frame, so slow frames do not trigger it either.
+    emscripten_set_interval([](void *) { if (emscripten_get_now() - g_lastFrameMs > 30.0) FrameCb(nullptr); }, 10.0, nullptr);
     return 0;
 }

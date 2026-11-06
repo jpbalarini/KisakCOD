@@ -156,7 +156,8 @@ Every tab that opens the game connects to it and is assigned a virtual address, 
 
 - **Host:** open `http://localhost:8080/`, choose **Start New Server** in the main menu, pick a map and press Start (or skip the menus with
   `?args=%2Bdevmap%20mp_crash`). It is a listen server: the hosting tab is the server, so keep it open (a hidden tab keeps serving through a
-  worker-timer watchdog in `app/main.cpp`, since `requestAnimationFrame` stops in hidden tabs).
+  worker-timer watchdog in `app/main.cpp`, since `requestAnimationFrame` stops in hidden tabs: ~25 fps there, versus 90+ when visible, so
+  keep the host's window visible if you can).
 - **Join:** open the game in another tab (or computer, see below), choose **Join Game**. The browser starts on source *Local* and lists the
   servers found on the relay's virtual LAN (Refresh List rescans); select one and press Join Server. The joiner loads the map, then picks a
   team/class like in single player. (`?args=%2Bconnect%2010.77.0.1`, or `connect <address>` in the console, still works; the host's address is
@@ -178,6 +179,31 @@ Every tab that opens the game connects to it and is assigned a virtual address, 
   -L 8081:localhost:8081 <this-mac>`: its browser then sees `localhost`.
 - **Query a server** (works from anything that can speak WebSocket, e.g. a script): `getinfo`/`getstatus` out-of-band packets, see `tools/relay.py`'s
   `SimpleClient`. LAN broadcast (`255.255.255.255`) is forwarded to every other tab by the relay; that is what the in-game LAN browser sends.
+
+### Ping / latency
+The scoreboard ping is the server's own measure (`SV_CalcPings`): the time from sending a snapshot until the first usercmd packet that acknowledges
+it arrives, averaged over the last 32 snapshots. Every engine "packet" here crosses the browser's event loop and a TCP stream, so it contains:
+the transport (Wi-Fi + TCP + the relay), the time a packet waits in the browser queue until the engine's next frame polls it (`Com_EventLoop`
+runs once or twice per frame, so ~half a frame on each side), and the engine's reaction. Healthy numbers measured on one machine (network ~0,
+both tabs ~90 fps): host 10 ms (loopback), remote client 13-20 ms. A LAN game with pings of 200+ is not expected and means one of those parts
+is large. To find which:
+- `web/run.sh --net-stats` (relay): pings every connected tab once a second and prints, every 5 s, `rtt avg/max/min` and packet rates per tab
+  (`[relay] 10.77.0.2 (192.168.1.23): rtt avg 6.2 ms max 41.0 ms ...`). That is the transport plus how long the tab's event loop was busy:
+  a high *max* with a low avg = stalls (Wi-Fi retransmissions: TCP holds back every later packet until a lost one is resent; macOS AWDL /
+  AirDrop channel hopping; power saving), a high avg = a congested link (a game-data download on the same Wi-Fi, bufferbloat) or a slow link.
+  Seconds-long values = the page was frozen (map load).
+- `?args=%2Bset%20net_stats%201` (in the page, also `net_stats 1` in the console): `[net]` line in the page log (`?log`) every 5 s: this tab's
+  frame period (avg/max), packets/s, **queue wait** (how long received packets sat before the engine polled them) and **reaction** (engine time
+  from receiving a packet to sending the next one) and **wire rtt** (once a second the tab sends a timestamped datagram to `127.0.0.1`, which
+  the relay loops straight back: Wi-Fi + TCP + relay, measured in the WebSocket message handler, so it needs no relay terminal; it includes up
+  to one frame of waiting for the page's event loop, so ~9 ms on localhost at 90 fps is the floor). Queue wait of tens of ms = the tab runs
+  slowly/hitches (slow GPU, hidden tab, shader compiles); ~2 ms = fine. `wire rtt` max/`>100 ms` count high = the link stalls; `NO REPLY` = nothing
+  came back for 5 s.
+- Gotchas: the scoreboard ping only measures the *freshest* snapshot a client acknowledges, so a client that polls slowly (a hidden tab at 6.7 fps)
+  still shows a low ping while its game state is up to 150 ms stale: judge by `net_stats` frame period, not by the scoreboard alone. A tab that
+  is hidden/occluded/minimised has no `requestAnimationFrame`; the watchdog drives it (before 2026-11-06 at 6.7 fps, now ~25 fps; `?args=--sim-hidden`
+  reproduces that mode in a visible tab). The client sends one packet per rendered frame (~90/s): the engine treats the relay's 10.x addresses as
+  a LAN and skips `cl_maxpackets`.
 
 How it fits together:
 - `platform/net_web.cpp`: `Sys_GetPacket`/`Sys_SendPacket`/`Sys_StringToAdr`/`Sys_IsLANAddress`/`NET_*` over one WebSocket owned by the engine's worker
