@@ -6303,12 +6303,14 @@ void __cdecl R_RegisterShaderConst(uint32_t dest, const float *value, GfxShaderC
             "consts->count doesn't index ARRAY_COUNT( consts->dest )\n\t%i not in [0, %i)",
             consts->count,
             16);
-    for (sortedIndex = consts->count;
-        sortedIndex && *(&consts->count + sortedIndex + 1) > dest;
-        consts->value[sortedIndex + 1] = consts->value[sortedIndex])
+    // Insertion sort by dest (ascending). The decompiled loop condition read `*(&consts->count + sortedIndex + 1)`: a 32-bit read stepping from the
+    // `count` field, where the original meant the 16-bit dest[sortedIndex - 1]. That compared against uninitialised stack (the unused part of the block),
+    // so the order of the literal constants - and Material_Compare, which sorts materials by them - was random between calls: std::sort then ran off
+    // the array (crash in Material_Compare while a client joined a game).
+    for (sortedIndex = consts->count; sortedIndex && consts->dest[sortedIndex - 1] > dest; --sortedIndex)
     {
-        --sortedIndex;
-        consts->dest[sortedIndex + 1] = consts->dest[sortedIndex];
+        consts->dest[sortedIndex] = consts->dest[sortedIndex - 1];
+        consts->value[sortedIndex] = consts->value[sortedIndex - 1];
     }
     consts->dest[sortedIndex] = dest;
     consts->value[sortedIndex] = value;
@@ -6581,6 +6583,7 @@ uint32_t __cdecl R_DrawSurfPrimarySortKey(const Material *material)
             64);
     return material->info.sortKey;
 }
+
 
 void __cdecl Material_SortInternal(Material **sortedMaterials, uint32_t materialCount)
 {
