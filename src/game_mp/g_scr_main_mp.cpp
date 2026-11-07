@@ -38,6 +38,15 @@
 //   struct scr_data_t g_scr_data 82e8a4b8     g_scr_main_mp.obj
 scr_data_t g_scr_data;
 
+#ifdef KISAK_WEB
+// web/platform/bots_web.cpp: the built-ins the Bot Warfare scripts expect from the engine (botaction, fs_fopen, ...)
+void(__cdecl *KisakBots_GetFunction(const char **pName, int *type))();
+void(__cdecl *KisakBots_GetMethod(const char **pName))(scr_entref_t);
+bool KisakBots_Enabled();
+static int g_kisakBotsInit;
+#endif
+
+
 BuiltinFunctionDef functions[] =
 {
   { "createprintchannel", &GScr_CreatePrintChannel, 1 },
@@ -390,6 +399,10 @@ void __cdecl GScr_LoadGameTypeScript()
         "maps/mp/gametypes/_callbacksetup",
         "CodeCallback_PlayerLastStand",
         1);
+#ifdef KISAK_WEB
+    // Bot Warfare (web/bots, see platform/bots_web.cpp): compiled with the other game scripts, started right after the gametype's startup callback
+    g_kisakBotsInit = KisakBots_Enabled() ? GScr_LoadScriptAndLabel("maps/mp/bots/_kisak", "init", 0) : 0;
+#endif
 }
 
 int32_t __cdecl GScr_LoadScriptAndLabel(const char *filename, const char *label, int32_t bEnforceExists)
@@ -5327,7 +5340,11 @@ void GScr_AddTestClient()
 {
     gentity_s *ent; // [esp+0h] [ebp-4h]
 
+#ifdef KISAK_WEB
+    ent = SV_AddTestClient(Scr_GetNumParam() ? Scr_GetString(0) : nullptr);   // addtestclient(name): the Bot Warfare scripts name their bots
+#else
     ent = SV_AddTestClient();
+#endif
     if (ent)
         Scr_AddEntity(ent);
 }
@@ -6437,6 +6454,13 @@ void __cdecl Scr_StartupGameType()
 
     callback = Scr_ExecThread(g_scr_data.gametype.startupgametype, 0);
     Scr_FreeThread(callback);
+#ifdef KISAK_WEB
+    if (g_kisakBotsInit)
+    {
+        callback = Scr_ExecThread(g_kisakBotsInit, 0);
+        Scr_FreeThread(callback);
+    }
+#endif
 }
 
 void __cdecl Scr_PlayerConnect(gentity_s *self)
@@ -6599,7 +6623,11 @@ void(__cdecl *__cdecl Scr_GetFunction(const char **pName, int *type))()
             return functions[i].actionFunc;
         }
     }
+#ifdef KISAK_WEB
+    return KisakBots_GetFunction(pName, type);
+#else
     return 0;
+#endif
 }
 
 void(__cdecl *__cdecl BuiltIn_GetMethod(const char **pName, int *type))(scr_entref_t)
@@ -6639,7 +6667,12 @@ void(__cdecl *__cdecl Scr_GetMethod(const char **pName, int *type))(scr_entref_t
     if (method)
         return method;
 
-    return BuiltIn_GetMethod(pName, type);
+    method = BuiltIn_GetMethod(pName, type);
+#ifdef KISAK_WEB
+    if (!method)
+        method = KisakBots_GetMethod(pName);
+#endif
+    return method;
 }
 
 void __cdecl GScr_Shutdown()

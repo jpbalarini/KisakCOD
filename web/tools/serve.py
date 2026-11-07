@@ -352,9 +352,9 @@ class DedicatedServer:
                        r"^(Entity deltas|New entities|Removed entities|Temp entity|Client deltas|New clients|Removed clients|Playerstate deltas|"
                        r"Playerstate nodelta|Server commands) - \d+ bits|^Received packet \d+ of stats data|^Gamestate has |^\s+(Largest|Average) config string")
 
-    def __init__(self, node, script, data, relay_url, cfg, engine_args, restart=True, verbose=False):
+    def __init__(self, node, script, data, relay_url, cfg, engine_args, restart=True, verbose=False, bots=""):
         self.node, self.script, self.data, self.relay_url = node, script, data, relay_url
-        self.cfg, self.engine_args, self.restart, self.verbose = cfg, engine_args, restart, verbose
+        self.cfg, self.engine_args, self.restart, self.verbose, self.bots = cfg, engine_args, restart, verbose, bots
         self.proc = None
         self.stopping = False
         self.log = None
@@ -374,6 +374,8 @@ class DedicatedServer:
         cmd = [self.node, "--stack-size=7000", self.script, f"--relay={self.relay_url}"]
         if self.cfg:
             cmd.append(f"--cfg={self.cfg}")
+        if self.bots:
+            cmd.append(f"--bots={self.bots}")
         cmd += self.engine_args
         self.proc = subprocess.Popen(cmd, cwd=home, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         print(f"[serve] dedicated server started (pid {self.proc.pid}); its full log: {self.log.name}", flush=True)
@@ -479,6 +481,9 @@ def main():
     ap.add_argument("--dedicated-build", default=os.path.join(here, "..", "build", "dedicated"), help="directory with dedicated.js (python3 web/tools/build.py --link dedicated)")
     ap.add_argument("--dedicated-cfg", default=os.path.join(here, "..", "dedicated", "server.cfg"), help="server config for --dedicated (empty = none)")
     ap.add_argument("--dedicated-args", default="", help='extra engine arguments for the dedicated server, e.g. "+set sv_hostname MyServer +map_rotate"')
+    ap.add_argument("--dedicated-bots", default=os.path.join(here, "..", "bots"),
+                    help="Bot Warfare scripts for the dedicated server (default web/bots; empty = no bot support). No bot is ever added by itself: "
+                         "type `addbot [n]` / `kickbots` in this console")
     ap.add_argument("--dedicated-verbose", action="store_true", help="show the dedicated server's start-up chatter on the console too (server.log has everything)")
     ap.add_argument("--no-dedicated-restart", action="store_true", help="do not restart the dedicated server when it crashes")
     ap.add_argument("--node", default="node", help="the node executable for --dedicated (22 or newer)")
@@ -524,7 +529,8 @@ def main():
             if not getattr(rt, "local_port", None):
                 sys.exit("[serve] the relay did not start (see above), so there is nothing for the dedicated server to connect to")
             dedicated = DedicatedServer(node, script, ARGS.data, f"ws://127.0.0.1:{rt.local_port}/?role=server", cfg, shlex.split(ARGS.dedicated_args),
-                                        restart=not ARGS.no_dedicated_restart, verbose=ARGS.dedicated_verbose)
+                                        restart=not ARGS.no_dedicated_restart, verbose=ARGS.dedicated_verbose,
+                                        bots=os.path.abspath(ARGS.dedicated_bots) if ARGS.dedicated_bots and os.path.isdir(ARGS.dedicated_bots) else "")
     httpd = Server((bind, ARGS.port), Handler)
     if ssl_ctx:
         # handshake lazily in the per-connection handler thread so one stalled client cannot block accept()

@@ -10,6 +10,8 @@
 //   --data=DIR     the CoD4 install directory (default: $KISAK_INSTALL_PATH). It is only ever READ: everything the engine writes stays in memory.
 //   --relay=URL    the WebSocket relay that stands in for UDP (web/tools/relay.py); default ws://127.0.0.1:8081/?role=server
 //   --cfg=FILE     a server config (host path), run as `exec server.cfg` before the other commands
+//   --bots=DIR     the Bot Warfare scripts (web/bots; platform/bots_web.cpp). Without it the server has no bot support. It never adds a bot by
+//                  itself: type `addbot [count]` / `kickbots` on the console, or set bots_manage_fill in the config.
 // The console is stdin: type engine commands (`status`, `map mp_crash`, `kick <name>`, `say hi`, `quit`).
 #include <universal/q_shared.h>
 #include <Windows.h>
@@ -147,8 +149,9 @@ int main(int argc, char **argv)
         if (!strncmp(argv[i], "--data=", 7)) { dataDir = argv[i] + 7; continue; }
         if (!strncmp(argv[i], "--relay=", 8)) { relay = argv[i] + 8; continue; }
         if (!strncmp(argv[i], "--cfg=", 6)) { cfg = argv[i] + 6; continue; }
+        if (!strncmp(argv[i], "--bots=", 7)) { if (argv[i][7]) setenv("KISAK_BOTS_DIR", argv[i] + 7, 1); continue; }
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            fprintf(stderr, "usage: dedicated.js [--data=DIR] [--relay=ws://host:8081/?role=server] [--cfg=server.cfg] [+engine args ...]\n");
+            fprintf(stderr, "usage: dedicated.js [--data=DIR] [--relay=ws://host:8081/?role=server] [--cfg=server.cfg] [--bots=DIR] [+engine args ...]\n");
             return 0;
         }
         extra += extra.empty() ? "" : " ";

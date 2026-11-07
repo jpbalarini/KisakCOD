@@ -691,6 +691,14 @@ char *__cdecl Scr_ReadFile(const char *filename, char *extFilename, const char *
 {
     int file; // [esp+24h] [ebp-4h] BYREF
 
+#ifdef KISAK_WEB
+    {
+        // scripts below the bots directory (web/platform/bots_web.cpp) come from the host disk, never from the game data
+        extern char *KisakBots_ReadScript(const char *extFilename, const char *codePos, bool archive);
+        if (char *botScript = KisakBots_ReadScript(extFilename, codePos, archive))
+            return botScript;
+    }
+#endif
     if (*(_BYTE *)fs_gameDirVar->current.integer)
     {
         if ((FS_FOpenFileRead(extFilename, &file) & 0x80000000) != 0)

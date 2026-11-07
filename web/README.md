@@ -354,6 +354,18 @@ python3 web/tools/package_server.py                                             
 - **Moving it to the other machine:** `package_server.py` makes a tarball with the scripts, both wasm builds, `server.cfg`, the load traces and a `run-server.sh` /
   `README.txt`; it contains **no game data**: copy your own CoD4 install over (this project never ships or hosts it, and `--lan` serves it to everyone who can reach
   the port: private networks only). On the machine: `tar xzf kisak-server.tar.gz && cd kisak-server && ./run-server.sh --data "<CoD4 Data dir>"`.
+- **Bots (done, dedicated server only):** AI players, [Bot Warfare](https://github.com/ineedbots/iw3_bot_warfare)'s GSC scripts in `web/bots/` on top of the engine's stock
+  test clients. **None are added by default.** Type `addbot [count]` in the server console to add some, `kickbots` to remove them all (they stay across the map
+  rotation until then); `set bots_manage_fill N` keeps the server filled up to N players. `web/bots/README.md` has the dvars (skill, teams, chat on/off) and the
+  credits. How: the scripts need the handful of built-ins a CoD4x server gives them (`botaction`, `botmovement`, `botstop`, `botmeleeparams`, `isbot`, `fs_fopen`
+  and friends, `addtestclient(name)`), implemented in `platform/bots_web.cpp`; the engine reads those scripts (and the waypoint files of the 15 stock maps) from the
+  host directory `--bots=DIR` / `KISAK_BOTS_DIR` before looking in the fastfiles (`Scr_ReadFile`), runs `maps/mp/bots/_kisak.gsc` right after the gametype's
+  startup callback (`Scr_StartupGameType`), and `SV_BotUserMove` replays what a script pressed as the bot's usercmd. Stock `scr_testclients` bots still behave as before
+  (random input). Fixed on the way: a test client's usercmd had `serverTime` 0, which `ClientThink_real` clamps to `level.time - 1000`, so a test client could never walk;
+  a kicked test client stayed a `ZMBI` zombie for ever (`SV_CheckTimeouts` skipped test clients); a test client never rejoined after a map change
+  (a human is let in when it answers the stats request, a bot never does, so it sat in `CNCT` while the scripts added a second set): `SV_SpawnServer` now drops the test clients
+  and sets `bots_manage_add` to their number, so the scripts bring the same bots back on the new map. A tab that *hosts* a game has no bots (it cannot read the scripts from
+  disk). `serve.py --dedicated-bots ''` turns the support off.
 - **Limits:** players have no real identity (the Steam shim accepts the page's random `KWEB` ticket, so bans are by that id only); `sv_pure 0` (no .iwd checksum check);
   `dedicated 2` is the default but 1 and 2 behave alike here (no heartbeat/master server). Developed and tested on macOS; Linux is expected to work (nothing in it is
   macOS-specific) but has not been tried yet. A server-side `Sys_Error` ends the process (exit code 1) and the supervisor restarts it.

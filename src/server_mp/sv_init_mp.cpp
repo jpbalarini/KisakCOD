@@ -385,6 +385,10 @@ void __cdecl SV_SetExpectedHunkUsage(char *mapname)
     }
 }
 
+#ifdef KISAK_WEB
+bool KisakBots_Enabled();   // web/platform/bots_web.cpp
+#endif
+
 void __cdecl SV_SpawnServer(char *mapname)
 {
     const char *denied; // [esp+18h] [ebp-B0h]
@@ -432,6 +436,27 @@ void __cdecl SV_SpawnServer(char *mapname)
     if (com_sv_running->current.enabled)
     {
         savepersist = G_GetSavePersist();
+#ifdef KISAK_WEB
+        {
+            // A test client never answers the "requeststats" that brings a human into the new map, so it sat in CNCT for ever and was never
+            // entered into the world. Drop them here, while the old game is still running (a normal disconnect), and have the Bot Warfare
+            // scripts bring the same number back: they add `bots_manage_add` bots once the new map is up.
+            int droppedBots = 0;
+            for (i = 0; i < sv_maxclients->current.integer; ++i)
+            {
+                client_t *bot = &svs.clients[i];
+                if (bot->header.state >= CS_CONNECTED && bot->bIsTestClient)
+                {
+                    SV_DropClient(bot, "EXE_DISCONNECTED", false);
+                    bot->header.state = CS_FREE;
+                    bot->lastPacketTime = 0;
+                    ++droppedBots;
+                }
+            }
+            if (droppedBots && KisakBots_Enabled())
+                Dvar_SetIntByName("bots_manage_add", droppedBots);
+        }
+#endif
         i = 0;
         client = svs.clients;
         while (i < sv_maxclients->current.integer)

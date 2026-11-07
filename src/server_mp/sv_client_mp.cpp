@@ -1729,7 +1729,11 @@ void __cdecl SV_ExecuteClientCommand(client_t *cl, char *s, int clientOK, int fr
     SV_Cmd_EndTokenizedString();
 }
 
-gentity_s *__cdecl SV_AddTestClient()
+#ifdef KISAK_WEB
+void KisakBots_ResetClient(int clientNum);   // web/platform/bots_web.cpp
+#endif
+
+gentity_s *__cdecl SV_AddTestClient(const char *name)
 {
     netadr_t v1; // [esp-14h] [ebp-458h]
     client_t *client; // [esp+0h] [ebp-444h]
@@ -1746,6 +1750,30 @@ gentity_s *__cdecl SV_AddTestClient()
         ++i;
     if (i == sv_maxclients->current.integer)
         return 0;
+#ifdef KISAK_WEB
+    // The bot scripts pick the names (scriptdata/botnames.txt). The name goes into a \key\value info string: keep it to harmless characters.
+    char botName[32];
+    snprintf(botName, sizeof botName, "bot%d", botport);
+    if (name && *name)
+    {
+        char clean[24];
+        int n = 0;
+        for (const char *p = name; *p && n < 20; ++p)
+            if (isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.' || *p == '[' || *p == ']')
+                clean[n++] = *p;
+        clean[n] = 0;
+        if (n >= 3)
+            strcpy(botName, clean);
+    }
+    snprintf(
+        file,
+        ARRAYSIZE(file),
+        "connect \"\\cg_predictItems\\1\\cl_punkbuster\\0\\cl_anonymous\\0\\color\\4\\head\\default\\model\\multi\\snaps\\20\\"
+        "rate\\5000\\name\\%s\\protocol\\%d\\qport\\%d\"",
+        botName,
+        1,
+        botport + 1);
+#else
     snprintf(
         file,
         ARRAYSIZE(file),
@@ -1754,6 +1782,7 @@ gentity_s *__cdecl SV_AddTestClient()
         botport,
         1,
         botport + 1);
+#endif
     SV_Cmd_TokenizeString(file);
     *(uint32_t *)a.ip = 0;
     memset(a.ipx, 0, sizeof(a.ipx));
@@ -1775,6 +1804,9 @@ gentity_s *__cdecl SV_AddTestClient()
     if (i == sv_maxclients->current.integer)
         return 0;
     clienta->bIsTestClient = 1;
+#ifdef KISAK_WEB
+    KisakBots_ResetClient(i);
+#endif
     SV_SendClientGameState(clienta);
     memset(&nullcmd, 0, sizeof(nullcmd));
     SV_ClientEnterWorld(clienta, &nullcmd);

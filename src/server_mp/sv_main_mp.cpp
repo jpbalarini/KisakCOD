@@ -883,6 +883,15 @@ void __cdecl SV_CheckTimeouts()
     {
         if (drop->lastPacketTime > svs.time)
             drop->lastPacketTime = svs.time;
+#ifdef KISAK_WEB
+        // This loop skipped test clients altogether, so a bot that was kicked stayed a zombie for ever (status showed "ZMBI") and its slot
+        // was never reused. Only the timeouts below make no sense for a bot (it sends no packets); freeing the zombie does.
+        if (drop->bIsTestClient && drop->header.state == CS_ZOMBIE && drop->lastPacketTime < zombiepoint)
+        {
+            drop->header.state = CS_FREE;
+            drop->lastPacketTime = 0;
+        }
+#endif
         if (!drop->bIsTestClient)
         {
             if (drop->header.state == CS_ZOMBIE && drop->lastPacketTime < zombiepoint)
@@ -1029,6 +1038,10 @@ void __cdecl SV_UpdatePerformanceFrame(float time)
     }
 }
 
+#ifdef KISAK_WEB
+bool KisakBots_FillCmd(int clientNum, usercmd_s *cmd);   // web/platform/bots_web.cpp
+#endif
+
 void __cdecl SV_BotUserMove(client_t *cl)
 {
     playerState_s *v1; // esi
@@ -1046,7 +1059,19 @@ void __cdecl SV_BotUserMove(client_t *cl)
                 "%s",
                 "SV_GameClientNum( cl - svs.clients )->weapon == static_cast<byte>( SV_GameClientNum( cl - svs.clients )->weapon )");
         nullcmd.weapon = SV_GameClientNum(cl - svs.clients)->weapon;
+#ifdef KISAK_WEB
+        // A bot driven by the Bot Warfare scripts (platform/bots_web.cpp) replays what they pressed. The stock path left serverTime at 0, which
+        // ClientThink_real clamps to level.time - 1000: a test client never advanced its commandTime, so it could not walk.
+        bool scriptedBot = KisakBots_FillCmd(cl - svs.clients, &nullcmd);
+        if (scriptedBot)
+        {
+            nullcmd.serverTime = svs.time;
+            nullcmd.offHandIndex = SV_GameClientNum(cl - svs.clients)->offHandIndex;
+        }
+        if (!scriptedBot && !G_GetClientArchiveTime(cl - svs.clients))
+#else
         if (!G_GetClientArchiveTime(cl - svs.clients))
+#endif
         {
             if (random() < 0.5 && sv_botsPressAttackBtn->current.enabled)
                 nullcmd.buttons |= BUTTON_ATTACK;

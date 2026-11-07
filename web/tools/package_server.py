@@ -42,6 +42,7 @@ What is in here
   web/build/app/            the browser build of the game
   web/build/dedicated/      the same engine as a headless server (runs under node, no browser, no GPU)
   web/dedicated/server.cfg  the server's settings: name, slots, game type, map rotation
+  web/bots/                 Bot Warfare (AI players): scripts and waypoints. None are added by themselves: type  addbot  in the console
   web/build/traces/         learned load orders that make the first map load faster for players (optional)
 
 Needs: python3 (3.9+), node 22 or newer, and a copy of your own Call of Duty 4 Modern Warfare game data (this bundle has none;
@@ -63,6 +64,8 @@ Run the game server by itself (a stand-alone relay somewhere else): see the top 
 
 Operating it
   The terminal that runs run-server.sh is the server console: type  status , map mp_backlot , map_rotate , kick <name> , say <text> , quit .
+  Bots: the server starts with none.  addbot [count]  adds that many (they stay across the map rotation),  kickbots  removes them all;
+  see web/bots/README.md for the settings (skill level, keeping the server filled up to N players, ...).
   Stopping serve.py (Ctrl+C, kill, closing the terminal) stops the game server too. If the game server crashes it is restarted
   automatically (2 s, then 4, 8, ... up to 30 s); after  quit  it stays down. The full server log is web/build/dedicated/server.log.
   Check it from anywhere:  python3 web/tools/probe.py --relay <this machine>:8081 [--tls]
@@ -112,6 +115,12 @@ def main():
     need("build/dedicated/dedicated.js")
     need("build/dedicated/dedicated.wasm")
     need("dedicated/server.cfg")
+    for dp, dns, fns in os.walk(os.path.join(WEB, "bots")):   # Bot Warfare scripts + waypoints (serve.py --dedicated-bots)
+        dns.sort()
+        for n in sorted(fns):
+            if n != ".DS_Store":
+                full = os.path.join(dp, n)
+                files.append((full, "web/bots/" + os.path.relpath(full, os.path.join(WEB, "bots")).replace(os.sep, "/")))
     if not args.no_traces:
         td = os.path.join(WEB, "build", "traces")
         if os.path.isdir(td):

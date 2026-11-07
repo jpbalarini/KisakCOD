@@ -13,6 +13,7 @@
 #include <string.h>
 
 static cmd_function_s s_dumpRawFile, s_gfxExp;
+void KisakBots_RegisterCommands();   // bots_web.cpp
 namespace d3dgl { void SetGfxExperiment(int); }
 static void GfxExp_f()
 {
@@ -46,5 +47,6 @@ static void DumpRawFile_f()
 void Web_RegisterCommands()
 {
     Cmd_AddCommandInternal("dumprawfile", DumpRawFile_f, &s_dumpRawFile);
+    KisakBots_RegisterCommands();   // addbot / kickbots (bots_web.cpp)
     Cmd_AddCommandInternal("gfxexp", GfxExp_f, &s_gfxExp);   // diagnostic: skip classes of GL work, see gfx/d3d9_gl_internal.h
 }
