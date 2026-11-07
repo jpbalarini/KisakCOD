@@ -459,6 +459,21 @@
   })();
   // the engine thread calls this once (platform/view_web.cpp): where to write the stage's size
   function kisakViewAttach(mem, ptr) { kisakView.attach(mem, ptr); }
+  // ---- mouse movement, exactly. The html5 mouse event the engine thread receives carries movementX/Y as int32, so the fractions a trackpad / a high-DPI
+  // display reports are already gone by then (a slow drag arrives as 0s). The engine thread (web/platform/input_web.cpp) gives us the address of
+  // { dx, dy, active } in shared wasm memory; every mousemove on the canvas adds its movement (a double, CSS px) there in 1/256 px, and the engine drains it each frame.
+  function kisakMouseAttach(mem, ptr) {
+    const i32 = new Int32Array(mem.buffer), at = ptr >> 2, FIXED = 256;
+    let remX = 0, remY = 0;                                    // (the rounding left over by the fixed-point step, carried to the next event)
+    document.getElementById('canvas').addEventListener('mousemove', (e) => {
+      remX += e.movementX * FIXED; remY += e.movementY * FIXED;
+      const ix = Math.trunc(remX), iy = Math.trunc(remY);
+      remX -= ix; remY -= iy;
+      if (ix) Atomics.add(i32, at, ix);
+      if (iy) Atomics.add(i32, at + 1, iy);
+    }, true);
+    Atomics.store(i32, at + 2, 1);
+  }
   // ---- audio: the engine's mixer thread (web/audio/al_web.cpp) calls this once its device opens. The AudioContext starts
   // suspended unless the page already had a user gesture (the Start button counts) and is resumed by the first click/key press.
   var kisakAudio = {};

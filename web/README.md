@@ -76,7 +76,14 @@ Controls: WASD / mouse / click as usual; Esc opens the in-game menu (the browser
 loss of pointer lock is turned back into an Esc press). The pointer is only locked while the player controls the game: not while a menu, the
 console or a script menu has the cursor (those follow the *absolute* pointer position, which a locked pointer stops reporting, so the menu cursor
 froze: clicking a team button right after joining used to lock it, because the client already counts as "in game" then). It is released when a menu
-opens and re-requested when it closes (the browser performs that at the next click or key press). `--no-profile` shows the profile screen instead of seeding one.
+opens and re-requested when it closes (the browser performs that at the next click or key press). The test is the one `CL_MouseEvent` makes: the scoreboard
+(Tab, the one shown while dead / at the end of a match) and `cl_bypassMouseInput` keep turning the view, so they do *not* release the pointer (they used to, which
+flashed the system cursor on every Tab and, if Tab was held past the browser's ~5 s of user activation, left the pointer unlocked). `--no-profile` shows the profile screen instead of seeding one.
+**Slow mouse movement used to be lost.** The html5 mouse event the engine thread receives holds `movementX/Y` as int32 (emscripten: `HEAP32[..] = e.movementX`), and the
+code then multiplied by render-width / CSS-width (< 1 whenever the canvas is shown larger than its render resolution, e.g. fullscreen) and truncated: a slow drag of 1 CSS px per
+event became 0, so the view only turned when the mouse moved fast, as if there were a dead zone. Now `app/shell.html` (`kisakMouseAttach`) adds each `mousemove`'s movement on the
+page's thread into counters in shared wasm memory (1/256 px) and `IN_Frame` drains them, carrying the sub-pixel remainder between frames. The old integer path is only a fallback
+for when the page did not attach. (The movement is still scaled by render / CSS size, as before, so the sensitivity at a given window size is unchanged.)
 The UI text fields and the console delete with the Backspace *character* (Windows sends it as `WM_CHAR` 8 and ignores the key event), so `platform/input_web.cpp`
 sends that character on Backspace too; before, Backspace did nothing in the profile-name box.
 **Keys must not leave the page.** The engine reads the keyboard on its own thread, so emscripten runs the key callbacks *after* the page's event was handled and their
