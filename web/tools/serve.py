@@ -18,11 +18,17 @@ the local network (see below) so other computers and phones can play.
   --tls-cert FILE --tls-key FILE serve https:// and wss:// (e.g. a certificate made with `mkcert 192.168.1.100 my-mac.local`)
   --allow-origin ORIGIN          let one more page origin/host use the relay (repeatable)
 
+  --dedicated                    also run the headless dedicated game server (the engine under node, web/build/dedicated, no browser tab
+                                 needed): web server + relay + game server from one command. Players join it at 10.77.0.1 or from the
+                                 in-game server browser. Needs `node` (22+) and the build: python3 web/tools/build.py --link dedicated.
+                                 Type engine commands here (status, map mp_crash, kick ...): they go to the server's console.
+  --dedicated-cfg FILE           its config (default web/dedicated/server.cfg); --dedicated-args "+set sv_hostname X +map_rotate"
+
 Browsers only enable SharedArrayBuffer (wasm threads) and AudioWorklet in a *secure context*: https://, or http://localhost. A plain
 http://192.168.x.y:8080 page therefore cannot run the game. Either use --tls-cert/--tls-key with a certificate the client trusts, or, in
 Chrome on the client, open chrome://flags/#unsafely-treat-insecure-origin-as-secure and add the http://192.168.x.y:8080 origin.
 """
-import argparse, json, mimetypes, os, re, socket, ssl, sys, threading, time
+import argparse, atexit, json, mimetypes, os, re, shlex, shutil, signal, socket, ssl, subprocess, sys, threading, time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import unquote, urlparse
 
@@ -332,6 +338,126 @@ def lan_addresses():
     return found
 
 
+# ---- the headless dedicated game server -------------------------------------------------------------------------------------------------
+class DedicatedServer:
+    """Runs web/build/dedicated/dedicated.js under node as a child process: restarts it if it crashes, forwards this process's stdin to its
+    console, and prints its output with a [dedi] prefix (the full output also goes to <build>/server.log)."""
+
+    # Lines that are noise on a server console (they stay in server.log): a headless engine never registers the per-channel shock volume dvars,
+    # so every map load warns once per channel and shock file; the rest is start-up chatter and the per-join network statistics dumps (a joining
+    # player's first snapshot prints a page of "fields changed" lines, the handshake one line per stats packet).
+    QUIET = re.compile(r"unknown dvar 'bg_shock_volume_|^Adding channel|iwd \(\d+ files\)|^\s+localized assets iwd|^\^6|^Precached weapon:|^[a-z0-9_]+_mp: WEAPON_|"
+                       r"^execing |^\s{4,}\w+ \".*\"$|^Trying to load file|^Loading fastfile|"
+                       r"fields changed: \(format|^(begin|end)-{20,}|^\d+\] \d+ byte snapshot|^Client .*'s snapshot$|"
+                       r"^(Entity deltas|New entities|Removed entities|Temp entity|Client deltas|New clients|Removed clients|Playerstate deltas|"
+                       r"Playerstate nodelta|Server commands) - \d+ bits|^Received packet \d+ of stats data|^Gamestate has |^\s+(Largest|Average) config string")
+
+    def __init__(self, node, script, data, relay_url, cfg, engine_args, restart=True, verbose=False):
+        self.node, self.script, self.data, self.relay_url = node, script, data, relay_url
+        self.cfg, self.engine_args, self.restart, self.verbose = cfg, engine_args, restart, verbose
+        self.proc = None
+        self.stopping = False
+        self.log = None
+
+    def start(self):
+        out_dir = os.path.dirname(self.script)
+        self.log = open(os.path.join(out_dir, "server.log"), "ab", buffering=0)
+        threading.Thread(target=self._supervise, name="dedicated", daemon=True).start()
+        threading.Thread(target=self._forward_stdin, name="dedicated-stdin", daemon=True).start()
+        atexit.register(self.stop)
+
+    def _spawn(self):
+        home = os.path.join(os.path.dirname(self.script), "home")   # the child's working directory: stray relative-path writes land here, never in the game data
+        os.makedirs(home, exist_ok=True)
+        # KISAK_EXIT_ON_STDIN_EOF: the server stops when this process dies (its stdin pipe closes), so it is never left running by itself
+        env = dict(os.environ, KISAK_INSTALL_PATH=self.data, KISAK_EXIT_ON_STDIN_EOF="1")
+        cmd = [self.node, "--stack-size=7000", self.script, f"--relay={self.relay_url}"]
+        if self.cfg:
+            cmd.append(f"--cfg={self.cfg}")
+        cmd += self.engine_args
+        self.proc = subprocess.Popen(cmd, cwd=home, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+        print(f"[serve] dedicated server started (pid {self.proc.pid}); its full log: {self.log.name}", flush=True)
+
+    def _pump(self, proc):
+        up = False
+        for raw in iter(proc.stdout.readline, b""):
+            self.log.write(raw)
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if not up and "local address" in line and line.startswith("Network:"):
+                up = True
+                m = re.search(r"local address ([0-9.]+)", line)
+                print(f"[serve] dedicated server is on the relay: players join it at {m.group(1) if m else '10.77.0.1'}, or from the in-game server browser", flush=True)
+            if self.verbose or not self.QUIET.search(line):
+                print(f"[dedi] {line}", flush=True)
+
+    def _supervise(self):
+        backoff = 2
+        while not self.stopping:
+            t0 = time.time()
+            try:
+                self._spawn()
+            except OSError as e:
+                print(f"[serve] cannot start the dedicated server: {e}", flush=True)
+                return
+            self._pump(self.proc)
+            rc = self.proc.wait()
+            if self.stopping:
+                return
+            lived = time.time() - t0
+            if rc == 0:
+                print("[serve] the dedicated server quit (exit code 0); it is not restarted. Restart this program to run it again.", flush=True)
+                return
+            print(f"[serve] the dedicated server died (exit code {rc}) after {lived:.0f} s", flush=True)
+            if not self.restart:
+                return
+            backoff = 2 if lived > 60 else min(backoff * 2, 30)
+            print(f"[serve] restarting it in {backoff} s", flush=True)
+            for _ in range(backoff * 10):
+                if self.stopping:
+                    return
+                time.sleep(0.1)
+
+    def _forward_stdin(self):
+        try:
+            for line in sys.stdin:
+                p = self.proc
+                if p and p.poll() is None:
+                    try:
+                        p.stdin.write(line.encode())
+                        p.stdin.flush()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.stopping:
+            return
+        self.stopping = True
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                p.stdin.write(b"quit\n")
+                p.stdin.flush()
+            except OSError:
+                pass
+            try:
+                p.wait(4)
+            except subprocess.TimeoutExpired:
+                p.terminate()
+                try:
+                    p.wait(3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+
+def node_major(node):
+    try:
+        return int(subprocess.check_output([node, "--version"], text=True).strip().lstrip("v").split(".")[0])
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return 0
+
+
 def main():
     global ARGS
     ap = argparse.ArgumentParser()
@@ -348,6 +474,14 @@ def main():
     ap.add_argument("--sim-rtt-ms", type=float, default=0, help="simulated network latency added to every game-data request")
     ap.add_argument("--sim-mbps", type=float, default=0, help="simulated bandwidth of each game-data connection, in Mbit/s")
     ap.add_argument("--traces", default="", help="where learned load traces are kept (default: <root>/../traces)")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument("--dedicated", action="store_true", help="also run the headless dedicated game server (see the top of this file)")
+    ap.add_argument("--dedicated-build", default=os.path.join(here, "..", "build", "dedicated"), help="directory with dedicated.js (python3 web/tools/build.py --link dedicated)")
+    ap.add_argument("--dedicated-cfg", default=os.path.join(here, "..", "dedicated", "server.cfg"), help="server config for --dedicated (empty = none)")
+    ap.add_argument("--dedicated-args", default="", help='extra engine arguments for the dedicated server, e.g. "+set sv_hostname MyServer +map_rotate"')
+    ap.add_argument("--dedicated-verbose", action="store_true", help="show the dedicated server's start-up chatter on the console too (server.log has everything)")
+    ap.add_argument("--no-dedicated-restart", action="store_true", help="do not restart the dedicated server when it crashes")
+    ap.add_argument("--node", default="node", help="the node executable for --dedicated (22 or newer)")
     ARGS = ap.parse_args()
     if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
         ap.error("--tls-cert and --tls-key go together")
@@ -357,6 +491,26 @@ def main():
     ARGS.traces = os.path.abspath(ARGS.traces)
     if ARGS.data:
         ARGS.data = os.path.abspath(ARGS.data)
+    dedicated = None
+    if ARGS.dedicated:
+        script = os.path.abspath(os.path.join(ARGS.dedicated_build, "dedicated.js"))
+        node = shutil.which(ARGS.node)
+        problems = []
+        if not ARGS.data or not os.path.isdir(ARGS.data):
+            problems.append("--dedicated needs the game data: --data \"<.../Call of Duty 4 Data>\" (or KISAK_INSTALL_PATH)")
+        if not ARGS.relay_port:
+            problems.append("--dedicated needs the relay (--relay-port is 0)")
+        if not os.path.isfile(script):
+            problems.append(f"{script} does not exist: build it with  python3 web/tools/build.py --link dedicated")
+        if not node:
+            problems.append(f"node ('{ARGS.node}') not found: install node 22 or newer (the dedicated server runs on it)")
+        elif node_major(node) < 22:
+            problems.append(f"node is too old ({node_major(node)}): the dedicated server needs 22 or newer (WebSocket built in)")
+        cfg = os.path.abspath(ARGS.dedicated_cfg) if ARGS.dedicated_cfg else ""
+        if cfg and not os.path.isfile(cfg):
+            problems.append(f"server config {cfg} does not exist (--dedicated-cfg '' runs without one)")
+        if problems:
+            ap.error("\n  ".join(problems))
     scheme = "https" if ARGS.tls_cert else "http"
     bind = "0.0.0.0" if ARGS.lan else "127.0.0.1"
     print(f"[serve] root={ARGS.root}\n[serve] data={ARGS.data or '(none)'}\n[serve] {scheme}://localhost:{ARGS.port}/", flush=True)
@@ -364,7 +518,13 @@ def main():
     import relay
     ssl_ctx = relay.make_ssl_context(ARGS.tls_cert, ARGS.tls_key) if ARGS.tls_cert else None
     if ARGS.relay_port:
-        relay.start_in_thread(bind, ARGS.relay_port, ARGS.verbose, ARGS.allow_origin, ARGS.lan, ssl_ctx, ARGS.net_stats)
+        rt = relay.start_in_thread(bind, ARGS.relay_port, ARGS.verbose, ARGS.allow_origin, ARGS.lan, ssl_ctx, ARGS.net_stats,
+                                   server_ip="10.77.0.1" if ARGS.dedicated else None)
+        if ARGS.dedicated:
+            if not getattr(rt, "local_port", None):
+                sys.exit("[serve] the relay did not start (see above), so there is nothing for the dedicated server to connect to")
+            dedicated = DedicatedServer(node, script, ARGS.data, f"ws://127.0.0.1:{rt.local_port}/?role=server", cfg, shlex.split(ARGS.dedicated_args),
+                                        restart=not ARGS.no_dedicated_restart, verbose=ARGS.dedicated_verbose)
     httpd = Server((bind, ARGS.port), Handler)
     if ssl_ctx:
         # handshake lazily in the per-connection handler thread so one stalled client cannot block accept()
@@ -378,7 +538,24 @@ def main():
             print("[serve] these http:// pages are not a secure context, so the game will not start in them as is. On each client either use\n"
                   "[serve] --tls-cert/--tls-key, or in Chrome open chrome://flags/#unsafely-treat-insecure-origin-as-secure, add\n"
                   f"[serve] {', '.join(f'{scheme}://{ip}:{ARGS.port}' for ip in ips) or 'the http://<this-ip>:' + str(ARGS.port) + ' origin'} and relaunch Chrome.", flush=True)
-    httpd.serve_forever()
+    if dedicated:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # run the cleanup (stop the game server) when this program is stopped
+        dedicated.start()
+    try:
+        httpd.serve_forever()
+    except (KeyboardInterrupt, SystemExit):   # Ctrl+C, or SIGTERM (the handler above)
+        pass
+    finally:
+        if dedicated:
+            dedicated.stop()
+    # Leave without finalizing the interpreter: the relay and output-pump threads are daemons that may still be printing, and Python 3.13+
+    # aborts ("could not acquire lock for <stdout> at interpreter shutdown") when it finalizes under them.
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.flush()
+        except Exception:
+            pass
+    os._exit(0)
 
 
 if __name__ == "__main__":

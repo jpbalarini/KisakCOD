@@ -10,6 +10,7 @@
 #include <ui/keycodes.h>
 #include <win32/win_local.h>
 #include <win32/win_input.h>
+#include <emscripten.h>
 #include <emscripten/html5.h>
 #include <stdio.h>
 #include <string.h>
@@ -154,11 +155,15 @@ static bool OnPointerLockChange(int, const EmscriptenPointerlockChangeEvent *e, 
 
 static bool OnContextMenu(int, const EmscriptenMouseEvent *, void *) { return true; }
 
+// (Not `typeof document`: in the browser the engine runs in a worker, which has none -- the html5 calls below are proxied to the page's main thread.)
+EM_JS(int, kn_is_node, (), { return (typeof process !== 'undefined' && process.versions && process.versions.node) ? 1 : 0; });
+
 void __cdecl IN_Init()
 {
     if (g_inited) return;
     g_inited = true;
     BuildKeyMap();
+    if (kn_is_node()) return;   // the dedicated server runs under node: no page, no input devices
     EMSCRIPTEN_RESULT r1 = emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, true, OnKey);
     EMSCRIPTEN_RESULT r2 = emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, true, OnKey);
     if (r1 || r2) fprintf(stderr, "[input] key callback registration failed: %d %d\n", r1, r2);

@@ -26,7 +26,8 @@ the engine sources under `src/` carry only small patches (see `git diff`).
   `getinfo`/`getstatus` queries, challenge, connect, stats upload, snapshots, usercmds, team/class menus and spawning all work between a
   hosting tab and a joining tab. Hosting is "Start New Server" in the menu, joining is the in-game server browser (source Local). `run.sh --lan`
   opens it to other computers on your network. See "Multiplayer" below.
-- **Next:** make it public (relay on a server, signed identities, a dedicated server build instead of a hosting tab), persistence of
+- **Dedicated server (done, local):** `serve.py --dedicated` runs the engine headless under node next to the web server and the relay, for a standalone machine (see "Dedicated server").
+- **Next:** make it public (relay on a server, signed identities), persistence of
   profile/config, a warm shader list. Known rough edges: no reverb/EQ (EFX is stubbed), no HRTF/3D beyond left-right pan, the loading screen only redraws when the engine yields, depth-texture shadow maps use the colour
   fallback, occlusion queries report 0, Bink is a stub, profiles are saved per browser only (see Profiles), no gamepad, no voice chat.
 
@@ -38,6 +39,7 @@ web/run.sh                                  # serves it + your game data on http
 `web/tools/exclude.txt` lists the Windows-only source files that are replaced for the web. Other tools:
 ```bash
 python3 web/tools/build.py --link loadtest  # the node load test: link web/build/loadtest/loadtest.js instead of the browser build
+python3 web/tools/build.py --link dedicated # the headless dedicated server (web/build/dedicated/dedicated.js, runs under node): see "Dedicated server"
 web/run_loadtest.sh                         # loads the fastfiles with the unmodified engine loader; override the data dir with KISAK_INSTALL_PATH=...
 KISAK_TRACE_FS=1 web/run_loadtest.sh        # trace every file open/stat the engine does
 LOADTEST_WATCHDOG_SEC=60 web/run_loadtest.sh   # exit(3) after 60 s (use with node --cpu-prof to find stalls)
@@ -227,6 +229,47 @@ How it fits together:
 - In the Claude desktop browser pane only the tab you drive is reliable for input (and screenshots lag a frame); two game tabs side by side work, but
   both share the CPU, so expect single-digit fps on the hidden one.
 
+## Dedicated server (no browser)
+A headless game server for a machine of its own (another Mac, a Linux mini-PC): the same wasm32 engine, run under **node** with `dedicated 2`, so no
+window, GPU, UI or sound, and the game code, scripts and netcode behave as on a listen server. Players still join from their browsers.
+`web/tools/serve.py --dedicated` starts all three parts from one command:
+
+| part | what it does |
+|---|---|
+| `tools/serve.py` | the web server: the game page and your game data (read-only); starts and supervises the other two |
+| `tools/relay.py` | the virtual LAN. The game server takes the reserved address **`10.77.0.1`**: only a loopback connection that asks for `?role=server` can have it, so it is the same address on every start and a restarted server takes it back over |
+| `build/dedicated/dedicated.js` | the game server under node (`dedicated/main.cpp`): the real `Com_Init`/`Com_Frame`, console on stdin, a frame sleeps ~1 ms like the stock dedicated loop |
+
+```bash
+python3 web/tools/build.py --link app && python3 web/tools/build.py --link dedicated     # dedicated.js + .wasm in web/build/dedicated (no GL/audio sources)
+web/run.sh --dedicated --lan [--tls-cert cert.pem --tls-key key.pem]                      # or: python3 web/tools/serve.py --data "<CoD4 Data dir>" --dedicated
+python3 web/tools/probe.py [getinfo] [--relay host:8081 --tls]                            # is it up? hostname, map, players (exit status 0 = answered)
+python3 web/tools/package_server.py                                                       # web/build/kisak-server.tar.gz for the other machine (below)
+```
+- **Needs** node 22 or newer (its global `WebSocket` is the relay transport) and python3. The machine that serves does not need emscripten.
+  Players open `http://<machine>:8080/` and use **Join Game** (source Local lists it as "KisakCoD4 web server"), or `connect 10.77.0.1`.
+  `--lan` and the secure-origin requirement are the same as for a hosting tab (see Multiplayer): give the server a certificate the players trust.
+  With TLS the game server itself connects to the relay through a plain loopback-only listener, so it never needs the certificate.
+- **Settings:** `dedicated/server.cfg` (name, slots, game type, scores, map rotation; it is run as `exec server.cfg` before the first map).
+  `--dedicated-cfg FILE` picks another one, `--dedicated-args "+set sv_hostname Foo +set g_gametype dm"` adds engine arguments (they win over the file).
+  Without `+map`/`+devmap` the server starts the config's `map_rotate` (with `--dedicated-cfg ''`, i.e. no config, it loads `mp_crash`).
+- **Console:** serve.py's own stdin: `status`, `map mp_backlot`, `map_rotate`, `kick <name>`, `say <text>`, `quit` (`quit` stops the game server for good). The
+  console shows the interesting lines (`[dedi]` prefix); `build/dedicated/server.log` keeps everything (`--dedicated-verbose` shows all).
+- **Supervision:** a crash restarts the game server (after 2 s, doubling to 30 s; `--no-dedicated-restart` turns it off). If serve.py dies, even by `kill -9`,
+  the game server follows (its stdin closes), so none is left running. `dedicated.js` can also be run by hand:
+  `KISAK_INSTALL_PATH=... node --stack-size=7000 web/build/dedicated/dedicated.js [--relay=ws://host:8081/?role=server] [--cfg=FILE] [+engine args]`.
+- **The data directory is never written** (`KISAK_MEMWRITE`, set by `dedicated.js`): kvfs reads from the real files and keeps everything the engine writes (config,
+  profile, logs) in memory, copying a file up only when it is opened for update. The child's working directory is `build/dedicated/home`.
+- **Moving it to the other machine:** `package_server.py` makes a tarball with the scripts, both wasm builds, `server.cfg`, the load traces and a `run-server.sh` /
+  `README.txt`; it contains **no game data**: copy your own CoD4 install over (this project never ships or hosts it, and `--lan` serves it to everyone who can reach
+  the port: private networks only). On the machine: `tar xzf kisak-server.tar.gz && cd kisak-server && ./run-server.sh --data "<CoD4 Data dir>"`.
+- **Limits:** players have no real identity (the Steam shim accepts the page's random `KWEB` ticket, so bans are by that id only); `sv_pure 0` (no .iwd checksum check);
+  `dedicated 2` is the default but 1 and 2 behave alike here (no heartbeat/master server). Developed and tested on macOS; Linux is expected to work (nothing in it is
+  macOS-specific) but has not been tried yet. A server-side `Sys_Error` ends the process (exit code 1) and the supervisor restarts it.
+- Gotchas: `exit()` hangs under node (a static destructor waits for a worker), so `Sys_Quit`/`Sys_Error` call `process.exit()` directly there (`ExitProcess` in
+  `platform/sys_web.cpp`); `EM_JS` bodies must not contain backslashes (the preprocessor stringifies them); `stringToNewUTF8` is not linked, use a caller buffer +
+  `stringToUTF8`; a browser engine worker has no `document` (detect node with `process.versions.node`, not by the lack of a DOM).
+
 ## Load time (game data over the network)
 The engine reads the game data with *synchronous* reads from its own worker threads; in the browser each one becomes an HTTP range request to
 `tools/serve.py`. Measured with `serve.py --sim-rtt-ms 8 --sim-mbps 150` (a decent Wi-Fi link), page open until the team-select menu of `mp_crash`:
@@ -284,7 +327,7 @@ and a cold *joiner* (own origin, own cache) **117 s -> 26 s**. What changed:
                buffers, queries, formats) and `shader_xlate.cpp`, the engine-independent D3D9 bytecode→GLSL translator
                (native test driver: `tools/xlate_test.cpp`).
 - `platform/`  web replacements for `win_main.cpp` (`sys_web.cpp`) and stand-ins for excluded subsystems (`stubs_web.cpp`).
-- `app/`       the browser entry point (`main.cpp`), HTML shell, I/O worker and audio worklet. `loadtest/` the node load test. `tools/` build/survey/link scripts + dev server.
+- `app/`       the browser entry point (`main.cpp`), HTML shell, I/O worker and audio worklet. `loadtest/` the node load test. `dedicated/` the headless server (`main.cpp`, `server.cfg`). `tools/` build/survey/link scripts + dev server.
 
 ## Gotchas found so far (all handled)
 - wasm traps on mismatched `call_indirect` signatures; the decompiled code casts function pointers freely →

@@ -26,6 +26,10 @@ namespace kvfs {
 
 static bool g_browser = false;
 static bool g_inited = false;
+// Files the engine writes live in memory (g_mem) instead of on disk. Always true in the browser; under node it is opt-in (KISAK_MEMWRITE=1,
+// set by the dedicated server) so that the game data directory is only ever read: reads then come from the real files unless a file of the
+// same name was written in memory.
+static bool g_memFs = false;
 static std::string g_root;            // install root, no trailing slash, lower-cased
 static std::string g_rootExact;
 
@@ -93,6 +97,8 @@ struct Handle {
 };
 static std::vector<Handle> g_handles;
 static const int kHandleBase = 1000;
+// Handles below kHandleBase are real file descriptors (node); memory / remote handles start at kHandleBase.
+static inline bool posixHandle(int h) { return !g_memFs || h < kHandleBase; }
 
 EM_JS(char *, kvfs_fetch_manifest, (), {
     try {
@@ -360,6 +366,7 @@ void init(const char *installRoot)
     if (g_inited) return;
     g_inited = true;
     g_browser = EM_ASM_INT({ return (typeof process !== 'undefined' && process.versions && process.versions.node) ? 0 : 1; }) != 0;
+    g_memFs = g_browser || getenv("KISAK_MEMWRITE") != nullptr;
     g_rootExact = installRoot ? installRoot : "";
     while (g_rootExact.size() > 1 && g_rootExact.back() == '/') g_rootExact.pop_back();
     g_root = lower(g_rootExact);
@@ -407,7 +414,7 @@ static Handle *handleOf(int h) { int i = h - kHandleBase; return (i >= 0 && i < 
 // ====================================================================== public API
 int open(const std::string &path, int of)
 {
-    if (!g_browser) {
+    if (!g_memFs) {
         std::string r = path;
         if (!(of & O_CREAT)) { if (!posixResolve(path, r)) { errno = ENOENT; return -1; } }
         return ::open(r.c_str(), of, 0666);
@@ -419,6 +426,11 @@ int open(const std::string &path, int of)
     if (!write) {
         if (mit != g_mem.end()) {
             int h = allocHandle(); Handle *hd = handleOf(h); hd->mem = mit->second; return h;
+        }
+        if (!g_browser) {   // node, writes in memory: everything not written by the engine is read from the real files
+            std::string r;
+            if (!posixResolve(path, r)) { errno = ENOENT; return -1; }
+            return ::open(r.c_str(), of & ~O_CREAT, 0666);
         }
         const RemoteFile *rf = findRemote(path);
         if (!rf) { errno = ENOENT; return -1; }
@@ -432,6 +444,18 @@ int open(const std::string &path, int of)
     else {
         if ((of & O_EXCL) && mit != g_mem.end()) { errno = EEXIST; return -1; }
         mf = std::make_shared<MemFile>();
+        if (!g_browser && !(of & O_TRUNC)) {   // node: opening a file that exists on disk for update starts from its content (copy-up; the disk file is untouched)
+            std::string r; struct stat st;
+            if (posixResolve(path, r) && ::stat(r.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= (64 << 20)) {
+                int fd = ::open(r.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    mf->data.resize((size_t)st.st_size);
+                    ssize_t got = ::read(fd, mf->data.data(), mf->data.size());
+                    mf->data.resize(got > 0 ? (size_t)got : 0);
+                    ::close(fd);
+                }
+            }
+        }
         g_mem[lp] = mf;
         g_memOrig[lp] = path;
     }
@@ -442,7 +466,7 @@ int open(const std::string &path, int of)
 
 int close(int h)
 {
-    if (!g_browser || h < kHandleBase) return ::close(h);
+    if (posixHandle(h)) return ::close(h);
     std::string saveRel; std::vector<uint8_t> snapshot; bool save = false;
     {
         std::lock_guard<std::mutex> g(g_mutex);
@@ -573,7 +597,7 @@ static int64_t remoteRead(Handle *hd, void *vbuf, size_t n, int64_t off)
 
 int64_t pread(int h, void *buf, size_t n, int64_t off)
 {
-    if (!g_browser || h < kHandleBase) return ::pread(h, buf, n, off);
+    if (posixHandle(h)) return ::pread(h, buf, n, off);
     Handle *hd;
     { std::lock_guard<std::mutex> g(g_mutex); hd = handleOf(h); if (!hd) { errno = EBADF; return -1; } }
     if (hd->mem) {
@@ -588,7 +612,7 @@ int64_t pread(int h, void *buf, size_t n, int64_t off)
 
 int64_t read(int h, void *buf, size_t n)
 {
-    if (!g_browser || h < kHandleBase) return ::read(h, buf, n);
+    if (posixHandle(h)) return ::read(h, buf, n);
     Handle *hd;
     { std::lock_guard<std::mutex> g(g_mutex); hd = handleOf(h); if (!hd) { errno = EBADF; return -1; } }
     int64_t r = pread(h, buf, n, hd->pos);
@@ -598,7 +622,7 @@ int64_t read(int h, void *buf, size_t n)
 
 int64_t write(int h, const void *buf, size_t n)
 {
-    if (!g_browser || h < kHandleBase) return ::write(h, buf, n);
+    if (posixHandle(h)) return ::write(h, buf, n);
     Handle *hd;
     { std::lock_guard<std::mutex> g(g_mutex); hd = handleOf(h); if (!hd || !hd->mem || !hd->writable) { errno = EBADF; return -1; } }
     std::lock_guard<std::mutex> g(hd->mem->m);
@@ -611,7 +635,7 @@ int64_t write(int h, const void *buf, size_t n)
 
 int64_t lseek(int h, int64_t off, int whence)
 {
-    if (!g_browser || h < kHandleBase) return ::lseek(h, off, whence);
+    if (posixHandle(h)) return ::lseek(h, off, whence);
     std::lock_guard<std::mutex> g(g_mutex);
     Handle *hd = handleOf(h);
     if (!hd) { errno = EBADF; return -1; }
@@ -624,7 +648,7 @@ int64_t lseek(int h, int64_t off, int whence)
 
 bool fileSize(int h, int64_t *size)
 {
-    if (!g_browser || h < kHandleBase) { struct stat st; if (::fstat(h, &st) != 0) return false; *size = st.st_size; return true; }
+    if (posixHandle(h)) { struct stat st; if (::fstat(h, &st) != 0) return false; *size = st.st_size; return true; }
     std::lock_guard<std::mutex> g(g_mutex);
     Handle *hd = handleOf(h);
     if (!hd) return false;
@@ -632,23 +656,27 @@ bool fileSize(int h, int64_t *size)
     return true;
 }
 
+static bool posixStat(const std::string &path, bool *isDir, int64_t *size, std::string *canonical)
+{
+    std::string r;
+    if (!posixResolve(path, r)) return false;
+    struct stat st;
+    if (::stat(r.c_str(), &st) != 0) return false;
+    if (isDir) *isDir = S_ISDIR(st.st_mode);
+    if (size) *size = st.st_size;
+    if (canonical) *canonical = r;
+    return true;
+}
+
 bool statPath(const std::string &path, bool *isDir, int64_t *size, std::string *canonical)
 {
-    if (!g_browser) {
-        std::string r;
-        if (!posixResolve(path, r)) return false;
-        struct stat st;
-        if (::stat(r.c_str(), &st) != 0) return false;
-        if (isDir) *isDir = S_ISDIR(st.st_mode);
-        if (size) *size = st.st_size;
-        if (canonical) *canonical = r;
-        return true;
-    }
+    if (!g_memFs) return posixStat(path, isDir, size, canonical);
     std::lock_guard<std::mutex> g(g_mutex);
     std::string lp = lower(path);
     auto mit = g_mem.find(lp);
     if (mit != g_mem.end()) { if (isDir) *isDir = false; if (size) *size = (int64_t)mit->second->data.size(); if (canonical) *canonical = path; return true; }
     if (g_memDirs.count(lp)) { if (isDir) *isDir = true; if (size) *size = 0; if (canonical) *canonical = path; return true; }
+    if (!g_browser) return posixStat(path, isDir, size, canonical);   // node, writes in memory: the rest is the real data directory
     std::string rel;
     if (!underRoot(path, &rel)) return false;
     if (rel.empty() || g_dirs.count(lower(rel)) || false) {
@@ -665,26 +693,31 @@ bool statPath(const std::string &path, bool *isDir, int64_t *size, std::string *
 bool listdir(const std::string &dir, std::vector<Entry> *out)
 {
     out->clear();
+    bool posixListed = false;   // node with writes in memory: the real directory's entries come first, then what the engine wrote
     if (!g_browser) {
         std::string r;
-        if (!posixResolve(dir, r)) return false;
-        DIR *d = opendir(r.c_str());
-        if (!d) return false;
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            Entry en; en.name = e->d_name;
-            struct stat st; std::string full = r + "/" + en.name;
-            en.isDir = ::stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-            en.size = ::stat(full.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
-            out->push_back(en);
+        bool ok = false;
+        if (posixResolve(dir, r)) {
+            if (DIR *d = opendir(r.c_str())) {
+                struct dirent *e;
+                while ((e = readdir(d))) {
+                    Entry en; en.name = e->d_name;
+                    struct stat st; std::string full = r + "/" + en.name;
+                    en.isDir = ::stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+                    en.size = ::stat(full.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0;
+                    out->push_back(en);
+                }
+                closedir(d);
+                ok = true;
+            }
         }
-        closedir(d);
-        return true;
+        if (!g_memFs) return ok;
+        posixListed = ok;
     }
     std::lock_guard<std::mutex> g(g_mutex);
     std::string rel;
-    bool found = false;
-    if (underRoot(dir, &rel)) {
+    bool found = posixListed;
+    if (g_browser && underRoot(dir, &rel)) {
         auto it = g_dirs.find(lower(rel));
         if (it != g_dirs.end()) { *out = it->second; found = true; }
         else if (rel.empty()) found = true;
@@ -713,14 +746,16 @@ bool listdir(const std::string &dir, std::vector<Entry> *out)
     }
     if (g_memDirs.count(ld)) found = true;
     if (!found) return false;
-    out->push_back(Entry{".", true, 0});
-    out->push_back(Entry{"..", true, 0});
+    if (!posixListed) {
+        out->push_back(Entry{".", true, 0});
+        out->push_back(Entry{"..", true, 0});
+    }
     return true;
 }
 
 bool unlink(const std::string &path)
 {
-    if (!g_browser) return ::unlink(path.c_str()) == 0;
+    if (!g_memFs) return ::unlink(path.c_str()) == 0;
     std::string lp = lower(path), rel;
     bool ok;
     { std::lock_guard<std::mutex> g(g_mutex); ok = g_mem.erase(lp) > 0; if (ok) g_memOrig.erase(lp); }
@@ -732,7 +767,7 @@ static std::string noTrailingSlash(std::string p) { while (p.size() > 1 && p.bac
 
 bool mkdir(const std::string &path_)
 {
-    if (!g_browser) return ::mkdir(path_.c_str(), 0777) == 0;
+    if (!g_memFs) return ::mkdir(path_.c_str(), 0777) == 0;
     const std::string path = noTrailingSlash(path_);
     std::string lp = lower(path), rel;
     bool isNew;
@@ -742,7 +777,7 @@ bool mkdir(const std::string &path_)
 }
 bool rmdir(const std::string &path_)
 {
-    if (!g_browser) return ::rmdir(path_.c_str()) == 0;
+    if (!g_memFs) return ::rmdir(path_.c_str()) == 0;
     const std::string path = noTrailingSlash(path_);
     std::string lp = lower(path), rel;
     bool ok;

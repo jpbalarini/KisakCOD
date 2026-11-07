@@ -27,8 +27,33 @@ def link_app(target, objs, root, web, build):
     for l in errs[:25]: print('  ', l[:220])
     if p.returncode: sys.exit(p.returncode)
 
+def link_dedicated(target, objs, root, web, build):
+    # The dedicated server: the same engine, run headless under node (no window, no GPU, no browser). Same flags as the load test, but optimised,
+    # with the browser build's memory limits, and the runtime stays alive for the timer-driven frame loop (EXIT_RUNTIME=0: Sys_Quit calls exit()).
+    out_dir = os.path.join(build, target); os.makedirs(out_dir, exist_ok=True)
+    assertions = '-sASSERTIONS=' + os.environ.get('KISAK_ASSERTIONS', '0')
+    cmd = ['em++', '-pthread', '-fwasm-exceptions', '-' + os.environ.get('KISAK_LINK_OPT', 'O2'), '-g0'] + objs + [
+        '-o', os.path.join(out_dir, 'dedicated.js'),
+        '-sPTHREAD_POOL_SIZE=8', '-sALLOW_MEMORY_GROWTH=1', '-sINITIAL_MEMORY=536870912', '-sMAXIMUM_MEMORY=2147483648',
+        '-sSTACK_SIZE=8388608', '-sDEFAULT_PTHREAD_STACK_SIZE=4194304', '-sSUPPORT_LONGJMP=wasm',
+        '-sEMULATE_FUNCTION_POINTER_CASTS=1', '--profiling-funcs', '-sERROR_ON_UNDEFINED_SYMBOLS=0', '-sWARN_ON_UNDEFINED_SYMBOLS=1',
+        '-sENVIRONMENT=node', '-sNODERAWFS=1', '-sEXIT_RUNTIME=0', assertions]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    open(os.path.join(out_dir, 'link.log'), 'w').write(p.stdout + p.stderr)
+    jsf = os.path.join(out_dir, 'dedicated.js')
+    if os.path.exists(jsf):   # debugging aid: print the wasm stack for uncaught exceptions on pthread workers
+        js = open(jsf).read().replace('captured an uncaught exception: ${ex}`', 'captured an uncaught exception: ${ex}\\n${ex && ex.stack}`')
+        open(jsf, 'w').write(js)
+    und = sorted(set(l.split('undefined symbol: ')[1].split(' ')[0] for l in p.stderr.splitlines() if 'undefined symbol: ' in l))
+    open(os.path.join(out_dir, 'undefined.txt'), 'w').write('\n'.join(und) + '\n')
+    errs = [l for l in p.stderr.splitlines() if 'error' in l.lower()]
+    print(f'link rc={p.returncode}; {len(und)} undefined symbols (web/build/{target}/undefined.txt); {len(errs)} error lines')
+    for l in errs[:25]: print('  ', l[:220])
+    if p.returncode: sys.exit(p.returncode)
+
 def link(target, objs, root, web, build):
     if target == 'app': return link_app(target, objs, root, web, build)
+    if target == 'dedicated': return link_dedicated(target, objs, root, web, build)
     if target != 'loadtest': raise SystemExit('unknown link target ' + target)
     out_dir = os.path.join(build, target); os.makedirs(out_dir, exist_ok=True)
     extra_objs = []

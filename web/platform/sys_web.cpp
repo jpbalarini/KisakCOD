@@ -107,19 +107,30 @@ void __cdecl Sys_LoadingKeepAlive()
 }
 
 // ---------------------------------------------------------------- lifecycle / errors
+// Ends the process with `code`. Under node (the dedicated server) it calls process.exit() right here: exit() first runs the static destructors,
+// and one of them blocks on a worker thread, so after `quit` the process sat there idle forever (a timer could not help: the blocked main
+// thread never runs it). A browser page has no `process`, and a pthread worker must not end only itself: both take the plain exit().
+static void ExitProcess(int code)
+{
+    fflush(stdout);
+    fflush(stderr);
+    EM_ASM({ if (typeof process !== 'undefined' && process.versions && process.versions.node && !ENVIRONMENT_IS_PTHREAD) process.exit($0); }, code);
+    exit(code);
+}
+
 void __cdecl Sys_NormalExit() {}
 void __cdecl Sys_QuitAndStartProcess(const char *, const char *) { Cbuf_AddText(0, "quit\n"); }
 
 void __cdecl Sys_OutOfMemErrorInternal(const char *filename, int line)
 {
     fprintf(stderr, "Out of memory: filename '%s', line %d\n", filename, line);
-    exit(-1);
+    ExitProcess(-1);
 }
 
 void Sys_NoFreeFilesError()
 {
     fprintf(stderr, "Out of free file handles / disk full\n");
-    exit(-1);
+    ExitProcess(-1);
 }
 
 int __cdecl Sys_CheckCrashOrRerun() { return 1; }
@@ -135,7 +146,7 @@ void Sys_Error(const char *error, ...)
     fprintf(stderr, "\n*** Sys_Error: %s\n", string);
     fflush(stderr);
     emscripten_log(EM_LOG_CONSOLE | EM_LOG_C_STACK | EM_LOG_NO_PATHS, "Sys_Error call stack:");
-    exit(1);
+    ExitProcess(1);
 }
 
 void __cdecl Sys_OpenURL(const char *url, int doexit)
@@ -152,12 +163,11 @@ bool g_webQuitting = false;
 
 void __cdecl Sys_Quit()
 {
-    fflush(stdout);
     g_webQuitting = true;
     emscripten_cancel_main_loop();
     // Back to the start screen: the page reloads itself (a fresh page also frees the engine's memory and workers). No such function under node.
     MAIN_THREAD_ASYNC_EM_ASM({ if (typeof kisakGameExited === 'function') kisakGameExited(); });
-    exit(0);
+    ExitProcess(0);
 }
 
 void __cdecl Sys_Print(const char *msg)

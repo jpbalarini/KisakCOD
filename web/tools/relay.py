@@ -10,7 +10,10 @@ This relay gives each connected tab a virtual IPv4 address (10.77.x.y, port 2896
   relay -> client : text   {"ip": "10.77.0.2", "port": 28960}               sent once after the handshake
 
 The relay never looks inside the payload: it is not a game server, only a switch. One tab hosts (`devmap mp_crash`), the others
-`connect <its address>`.
+`connect <its address>`. A dedicated server (web/build/dedicated, started by `serve.py --dedicated`) connects to ws://host:8081/?role=server
+instead: with --server-ip (default 10.77.0.1 under serve.py --dedicated) that address is reserved for it, so players can always
+`connect 10.77.0.1` and the server keeps its address across restarts. Only a connection from this machine can take it (--server-any-host
+lifts that), and tabs are never given it.
 
     python3 web/tools/relay.py [--host 127.0.0.1] [--port 8081] [--verbose]       run standalone
     python3 web/tools/relay.py --selftest                                           check routing with two raw clients
@@ -23,7 +26,7 @@ resolving a public hostname, so a web page on the internet still cannot reach it
 Standard library only (RFC 6455 subset: text/binary/continuation/ping/pong/close, masked client frames).
 """
 import argparse, asyncio, base64, hashlib, ipaddress, json, os, ssl, struct, sys, threading, time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 GAME_PORT = 28960
@@ -67,8 +70,10 @@ class Client:
 
 
 class Relay:
-    def __init__(self, verbose=False, allow_origins=None, lan=False, stats=False):
+    def __init__(self, verbose=False, allow_origins=None, lan=False, stats=False, server_ip=None, server_any_host=False):
         self.clients = {}                 # ip bytes -> Client
+        self.server_ip = bytes(map(int, server_ip.split("."))) if isinstance(server_ip, str) else server_ip   # reserved for role=server
+        self.server_any_host = server_any_host
         self.verbose = verbose
         self.allow_origins = set(allow_origins or [])
         self.lan = lan                    # also accept pages served from private-network addresses
@@ -99,7 +104,7 @@ class Relay:
     def _alloc_ip(self):
         for n in range(1, 65535):
             ip = bytes([10, 77, n >> 8, n & 255])
-            if ip not in self.clients:
+            if ip not in self.clients and ip != self.server_ip:
                 return ip
         return None
 
@@ -160,7 +165,23 @@ class Relay:
             accept = base64.b64encode(hashlib.sha1(headers["sec-websocket-key"].encode() + GUID).digest()).decode()
             writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                           f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
-            ip = self._alloc_ip()
+            ip = None
+            parts = lines[0].split(" ")
+            role = parse_qs(urlparse(parts[1] if len(parts) > 1 else "/").query).get("role", [""])[0]
+            if role == "server" and self.server_ip is not None:
+                host = (peer[0] if peer else "").replace("::ffff:", "")
+                if self.server_any_host or host in ("127.0.0.1", "::1"):
+                    old = self.clients.pop(self.server_ip, None)      # a previous instance (restarted server): this connection takes over
+                    if old is not None:
+                        try:
+                            old.writer.close()
+                        except Exception:
+                            pass
+                    ip = self.server_ip
+                else:
+                    print(f"[relay] {peer[0]} asked for the server address but is not on this machine: treated as a normal client", flush=True)
+            if ip is None:
+                ip = self._alloc_ip()
             if ip is None:
                 writer.write(self.frame(8, struct.pack(">H", 1013)))
                 return
@@ -199,7 +220,8 @@ class Relay:
             if pinger is not None:
                 pinger.cancel()
             if client is not None:
-                self.clients.pop(client.ip, None)
+                if self.clients.get(client.ip) is client:             # (a replaced server's old connection must not free the new one's address)
+                    self.clients.pop(client.ip, None)
                 print(f"[relay] {client.name} disconnected (rx {client.rx} tx {client.tx} dropped {client.dropped}, {len(self.clients)} online)", flush=True)
             try:
                 writer.close()
@@ -244,14 +266,17 @@ class Relay:
             await server.serve_forever()
 
 
-def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=None, lan=False, ssl_ctx=None, stats=False):
-    """Run the relay on its own event loop in a daemon thread (used by serve.py)."""
+def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=None, lan=False, ssl_ctx=None, stats=False, server_ip=None, server_any_host=False):
+    """Run the relay on its own event loop in a daemon thread (used by serve.py). The returned thread has `local_port`: a port on 127.0.0.1 for
+    processes on this machine (the dedicated server). It is `port` itself, unless the relay serves TLS: then it is an extra plain listener on
+    the same switch, so a local process does not have to trust the certificate."""
     ready = threading.Event()
+    holder = {}
 
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        relay = Relay(verbose, allow_origins, lan, stats)
+        relay = Relay(verbose, allow_origins, lan, stats, server_ip, server_any_host)
 
         async def main():
             try:
@@ -261,6 +286,10 @@ def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=No
                 ready.set()
                 return
             print(f"[relay] virtual LAN switch on {'wss' if ssl_ctx else 'ws'}://{host}:{port}/ (addresses 10.77.x.y:{GAME_PORT})", flush=True)
+            holder["local_port"] = port
+            if ssl_ctx:
+                local = await asyncio.start_server(relay.handle, "127.0.0.1", 0)
+                holder["local_port"] = local.sockets[0].getsockname()[1]
             if stats:
                 asyncio.ensure_future(relay._reporter())
             ready.set()
@@ -271,16 +300,23 @@ def start_in_thread(host="127.0.0.1", port=8081, verbose=False, allow_origins=No
     t = threading.Thread(target=run, name="relay", daemon=True)
     t.start()
     ready.wait(5)
+    t.local_port = holder.get("local_port")
     return t
 
 
 # ---- minimal blocking client, for the self test and web/tools/relay_probe.py --------------------------------------------------------
 class SimpleClient:
-    def __init__(self, host, port, origin=None):
+    def __init__(self, host, port, origin=None, path="/", tls=False):
         import socket
         self.s = socket.create_connection((host, port), timeout=5)
+        if tls:   # wss:// (a self-signed certificate is the normal case on a LAN: the certificate is not verified)
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.s = ctx.wrap_socket(self.s, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
-        req = (f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                "Sec-WebSocket-Version: 13\r\n" + (f"Origin: {origin}\r\n" if origin else "") + "\r\n")
         self.s.sendall(req.encode())
         resp = b""
@@ -370,6 +406,22 @@ def selftest():
                                           ("https://evil.example", 0, 0), ("http://8.8.8.8", 0, 0), ("http://192.168.1.100.evil.example", 0, 0),
                                           ("http://172.32.0.1", 0, 0), ("http://notlocal", 0, 0)]:
         assert strict._origin_ok(origin) == bool(want_strict) and lan._origin_ok(origin) == bool(want_lan), origin
+    # reserved address for a dedicated server (role=server from this machine): tabs never get it, a restarted server takes it back
+    port2 = 18082
+    start_in_thread("127.0.0.1", port2, server_ip="10.77.0.1")
+    t1 = SimpleClient("127.0.0.1", port2)
+    assert t1.hello["ip"] == "10.77.0.2", t1.hello                            # .1 is kept free for the server
+    s1 = SimpleClient("127.0.0.1", port2, path="/?role=server")
+    assert s1.hello["ip"] == "10.77.0.1", s1.hello
+    t1.send_datagram("10.77.0.1", 28960, b"hi")
+    assert s1.recv_datagram() == ("10.77.0.2", 28960, b"hi")
+    s2 = SimpleClient("127.0.0.1", port2, path="/?role=server")               # the server restarted: the new connection takes the address over
+    assert s2.hello["ip"] == "10.77.0.1", s2.hello
+    s1.close(); time.sleep(0.3)                                               # the old connection's cleanup must not free the new one's address
+    t1.send_datagram("10.77.0.1", 28960, b"again")
+    assert s2.recv_datagram() == ("10.77.0.2", 28960, b"again")
+    for cl in (t1, s1, s2):
+        cl.close()
     for cl in (a, b2, c, bad):                                                # let the relay log the disconnects before the interpreter exits
         cl.close()
     time.sleep(0.3)
@@ -386,6 +438,8 @@ def main():
     ap.add_argument("--allow-origin", action="append", default=[], help="additional page origin/host allowed to connect")
     ap.add_argument("--tls-cert", help="serve wss:// with this certificate (needed when the pages are served over https)")
     ap.add_argument("--tls-key", help="private key for --tls-cert")
+    ap.add_argument("--server-ip", help="virtual address reserved for a dedicated server connecting with ?role=server (e.g. 10.77.0.1)")
+    ap.add_argument("--server-any-host", action="store_true", help="let a dedicated server on another machine take --server-ip (default: only this machine)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -393,7 +447,7 @@ def main():
         return
     ssl_ctx = make_ssl_context(args.tls_cert, args.tls_key) if args.tls_cert else None
     try:
-        asyncio.run(Relay(args.verbose, args.allow_origin, args.lan, args.stats).serve(args.host or ("0.0.0.0" if args.lan else "127.0.0.1"), args.port, ssl_ctx))
+        asyncio.run(Relay(args.verbose, args.allow_origin, args.lan, args.stats, args.server_ip, args.server_any_host).serve(args.host or ("0.0.0.0" if args.lan else "127.0.0.1"), args.port, ssl_ctx))
     except KeyboardInterrupt:
         pass
 

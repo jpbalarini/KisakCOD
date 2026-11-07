@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the KisakCOD MP client (minus web/tools/exclude.txt) to wasm32 objects and optionally link a target.
 
-usage: build.py [-j N] [--force] [--only substr] [--link app|loadtest]
+usage: build.py [-j N] [--force] [--only substr] [--link app|loadtest|dedicated]
 """
 import argparse, os, re, subprocess, sys, shlex
 from concurrent.futures import ThreadPoolExecutor
@@ -45,7 +45,7 @@ def sources(target=None):
     # extra TUs that exist only for the web build
     res.append('web/shim/win32_shim.cpp')
     res.append('web/shim/kvfs.cpp')
-    if target != 'loadtest':
+    if target not in ('loadtest', 'dedicated'):   # (no WebGL device / Web Audio under node)
         for sub in ('gfx', 'audio'):
             gd = os.path.join(WEB, sub)
             res += ['web/%s/%s' % (sub, f) for f in sorted(os.listdir(gd)) if f.endswith('.cpp')]
