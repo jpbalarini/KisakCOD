@@ -299,6 +299,14 @@ How it fits together:
   after and can override them.
 - `app/main.cpp` calls `LiveStorage_ReadStats()` after `Com_Init`: the seeded profile never goes through the menu profile switch that normally
   initialises the player's stats, and the game scripts kick any remote player whose class stats are all zero (host exempt).
+- **XP, rank, kills, score, time played and Create a Class need a "ranked" match.** The game scripts only record anything when
+  `level.rankedMatch` is set, and `_globallogic.gsc` derives that from the server's pure flag: `level.onlineGame && getDvarInt("sv_pure")`. Web
+  servers run `sv_pure 0` (see above), so every match was unranked: the scoreboard counted points, but the End of Game screen, XP and rank stayed
+  at 0 and the profile's `mpdata` never changed. `GScr_GetDvarInt` (src/game_mp/g_scr_main_mp.cpp, `KISAK_WEB`) therefore answers 1 when a script
+  asks for `sv_pure`; the engine's own `sv_pure` stays 0, so none of the pure-client machinery switches on. Side effect = stock ranked rules: the
+  "Game Summary" popup appears after a match, and when a match is left with a single player (free-for-all) or a whole team gone (team modes, once
+  that team had players) the remaining side wins by forfeit and the map rotates. Create a Class is still locked until the player's rank allows it.
+  Needs the dedicated server restarted (rebuilt `dedicated.js`) and the browser page reloaded.
 - `dumprawfile <name>` (devcmds_web.cpp) prints a game script/rawfile from the loaded fastfiles to the log, e.g.
   `?args=%2Bdevmap%20mp_crash%20%2Bdumprawfile%20maps/mp/gametypes/_globallogic.gsc` (this is how the stats kick was found).
 - In the Claude desktop browser pane only the tab you drive is reliable for input (and screenshots lag a frame); two game tabs side by side work, but

@@ -895,6 +895,18 @@ void GScr_GetDvarInt()
     dvarName = Scr_GetString(0);
     dvarValue = Dvar_GetVariantString(dvarName);
 
+#ifdef KISAK_WEB
+    // The retail scripts decide "ranked match" (XP, rank, kills/score/time stats, unlocks, Create a Class) from the server's pure flag:
+    // _globallogic.gsc: level.rankedMatch = (level.onlineGame && getDvarInt("sv_pure")). Web servers run sv_pure 0 (they do not verify .iwd
+    // checksums, and turning it on would enable the whole pure-client machinery), so every match counted as unranked and nothing was ever
+    // recorded. Tell the scripts the server is pure; the engine's own sv_pure stays 0.
+    if (!I_stricmp(dvarName, "sv_pure"))
+    {
+        Scr_AddInt(1);
+        return;
+    }
+#endif
+
     Scr_AddInt(atoi(dvarValue));
 }
 
