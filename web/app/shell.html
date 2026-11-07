@@ -432,6 +432,16 @@
     }, true);
     document.addEventListener('keyup', (e) => { if (window.__gameStarted && isToggleKey(e)) { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
 
+    // The keys the game uses must not do what the browser does with them. The engine reads the keyboard on its own thread (web/platform/input_web.cpp),
+    // which only hears about an event after the browser has finished with it, so it cannot cancel anything. Tab is the one that matters: the scoreboard
+    // key moves the keyboard focus out of the page to the browser's toolbar (in fullscreen the toolbar slides down), after which the page gets neither
+    // the key-up (the scoreboard stays open) nor any other key-up (a held movement key keeps running). Space and the arrow keys would scroll, Alt would
+    // open a menu. Browser shortcuts (Cmd/Ctrl + a key), F5 and F12 are left to the browser, as input_web.cpp does.
+    const browserKey = (e) => (e.ctrlKey || e.metaKey) ? (e.code !== 'ControlLeft' && e.code !== 'ControlRight') : (e.code === 'F5' || e.code === 'F12');
+    const keepForGame = (e) => { if (window.__gameStarted && !browserKey(e)) e.preventDefault(); };
+    document.addEventListener('keydown', keepForGame, true);
+    document.addEventListener('keyup', keepForGame, true);
+
     // ---- the button appears while the mouse moves (a locked mouse, i.e. aiming, does not show it)
     let uiTimer = 0;
     function showUi() {

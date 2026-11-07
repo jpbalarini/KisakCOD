@@ -70,22 +70,54 @@ static bool ShouldPassToBrowser(const EmscriptenKeyboardEvent *e)
     return !strcmp(e->code, "F5") || !strcmp(e->code, "F11") || !strcmp(e->code, "F12");
 }
 
+// The engine's view of which keys / mouse buttons are held. A key-up must reach the engine for every key it saw go down (else the key stays "held":
+// the player keeps running, the scoreboard stays open), whatever modifiers are down at that moment, and must never be sent for a key it did not
+// see go down (CL_KeyEvent counts held keys and would be thrown off). Everything still held is released when the window loses the focus: the
+// key-up then goes to whatever has the focus (the browser's toolbar after a Tab, another application after Cmd+Tab), not to the page.
+static bool g_down[256];
+
+static void QueKey(int key, bool down)
+{
+    if (key <= 0 || key >= 256) return;
+    if (!down && !g_down[key]) return;
+    g_down[key] = down;
+    Sys_QueEvent(0, SE_KEY, key, down ? 1 : 0, 0, 0);
+}
+
+static void ReleaseAllKeys()
+{
+    for (int key = 1; key < 256; ++key) QueKey(key, false);
+    g_dx = g_dy = 0;
+}
+
 static bool OnKey(int type, const EmscriptenKeyboardEvent *e, void *)
 {
-    if (ShouldPassToBrowser(e)) return false;
     bool down = type == EMSCRIPTEN_EVENT_KEYDOWN;
     int key = KeyFromCode(e->code);
-    if (key) Sys_QueEvent(0, SE_KEY, key, down ? 1 : 0, 0, 0);
+    if (!down) {                       // (even Ctrl+<key>: let go of W while Ctrl, the crouch key, is still held)
+        if (key) QueKey(key, false);
+        return key != 0;
+    }
+    if (ShouldPassToBrowser(e)) return false;
+    if (key) QueKey(key, true);
     // Characters for text fields (console, profile name, chat): taken from keydown so they follow the key event, as WM_CHAR does
-    if (down && !e->ctrlKey && !e->metaKey && !e->altKey && e->key[0] && !e->key[1]) {
+    if (!e->ctrlKey && !e->metaKey && !e->altKey && e->key[0] && !e->key[1]) {
         unsigned char ch = (unsigned char)e->key[0];
         if (ch >= 32 && ch < 127) Sys_QueEvent(0, SE_CHAR, ch, 0, 0, 0);
     }
     // Windows delivers Backspace as a character (WM_CHAR, 8) as well, and that is what the UI text fields and the console delete with (they ignore the
     // key event). Held down, keydown repeats, like WM_CHAR does.
-    if (down && !strcmp(e->code, "Backspace") && !e->ctrlKey && !e->metaKey && !e->altKey) Sys_QueEvent(0, SE_CHAR, 8, 0, 0, 0);
-    return key != 0 || (down && e->key[0] && !e->key[1]);
+    if (!strcmp(e->code, "Backspace") && !e->ctrlKey && !e->metaKey && !e->altKey) Sys_QueEvent(0, SE_CHAR, 8, 0, 0, 0);
+    // (The value cannot cancel the browser's default action: these callbacks run on the engine thread, the event was long since handled on the page's
+    // thread. That is why shell.html has its own keydown listener that calls preventDefault() on the keys the game uses -- Tab above all, which would
+    // otherwise move the keyboard focus out of the page to the browser's toolbar.)
+    return key != 0 || (e->key[0] && !e->key[1]);
 }
+
+// The window lost the keyboard focus (Tab / a click moved it to the browser's toolbar, Cmd+Tab, a dialog) or the tab was hidden: the key-ups of
+// everything still held will not come to the page.
+static bool OnWindowBlur(int, const EmscriptenFocusEvent *, void *) { ReleaseAllKeys(); return false; }
+static bool OnVisibility(int, const EmscriptenVisibilityChangeEvent *e, void *) { if (e->hidden) ReleaseAllKeys(); return false; }
 
 static void CanvasScale(double *sx, double *sy)
 {
@@ -126,7 +158,7 @@ static bool OnMouseButton(int type, const EmscriptenMouseEvent *e, void *)
     int key = ButtonKey(e->button);
     if (!key) return false;
     bool down = type == EMSCRIPTEN_EVENT_MOUSEDOWN;
-    Sys_QueEvent(0, SE_KEY, key, down ? 1 : 0, 0, 0);
+    QueKey(key, down);
     // capture the mouse for first-person control while the player is controlling the game (not while a menu has the cursor)
     if (down && WantPointerLock()) emscripten_request_pointerlock(kCanvas, true);
     return true;
@@ -172,6 +204,9 @@ void __cdecl IN_Init()
     emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, true, OnMouseButton);
     emscripten_set_wheel_callback(kCanvas, nullptr, true, OnWheel);
     emscripten_set_pointerlockchange_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, true, OnPointerLockChange);
+    // (not captured: a capturing listener on the window would also see the blur of every element inside the page)
+    emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, OnWindowBlur);
+    emscripten_set_visibilitychange_callback(nullptr, true, OnVisibility);
     emscripten_set_contextmenu_callback(kCanvas, nullptr, true, OnContextMenu);
     Com_Printf(CON_CHANNEL_SYSTEM, "Browser input initialised\n");
 }

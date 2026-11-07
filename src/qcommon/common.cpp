@@ -1032,6 +1032,16 @@ void __cdecl Com_RunAutoExec(int localClientNum, int controllerIndex)
 #elif KISAK_SP
     Cmd_ExecuteSingleCommand(localClientNum, controllerIndex, (char*)"exec autoexec_dev.cfg");
 #endif
+#ifdef KISAK_WEB
+    // The game data ships a development autoexec (autoexec_dev_mp.cfg: "set com_statmon 1", ...) that retail builds never ran. Left alone it draws the
+    // stats monitor (red memory-budget lines top right, the FPS / file-access warning icons left of centre), and the FPS block and the version string
+    // are on by default too. Players do not want those on screen: turn them off after it (this also runs again on every profile switch, which
+    // re-executes the startup configs). They are ordinary dvars, so a player can turn them back on in the console (cg_drawFPS 1, com_statmon 1,
+    // cg_drawVersion 1) or with ?args=%2Bset%20cg_drawFPS%201 (command-line settings are applied after this).
+    Cmd_ExecuteSingleCommand(localClientNum, controllerIndex, (char*)"set com_statmon 0");
+    Cmd_ExecuteSingleCommand(localClientNum, controllerIndex, (char*)"set cg_drawFPS 0");
+    Cmd_ExecuteSingleCommand(localClientNum, controllerIndex, (char*)"set cg_drawVersion 0");
+#endif
     Dvar_SetInAutoExec(0);
 }
 

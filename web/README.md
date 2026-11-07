@@ -79,6 +79,18 @@ froze: clicking a team button right after joining used to lock it, because the c
 opens and re-requested when it closes (the browser performs that at the next click or key press). `--no-profile` shows the profile screen instead of seeding one.
 The UI text fields and the console delete with the Backspace *character* (Windows sends it as `WM_CHAR` 8 and ignores the key event), so `platform/input_web.cpp`
 sends that character on Backspace too; before, Backspace did nothing in the profile-name box.
+**Keys must not leave the page.** The engine reads the keyboard on its own thread, so emscripten runs the key callbacks *after* the page's event was handled and their
+return value cannot `preventDefault()`. Tab (the scoreboard key) therefore moved the browser focus to the toolbar (in fullscreen it slid down): the page never got the
+Tab key-up (scoreboard stuck open) nor the key-up of anything held at that moment (W kept running). Fixed three ways: `app/shell.html` has a capture-phase
+`keydown`/`keyup` listener on the page's thread that cancels every key except browser shortcuts (Cmd/Ctrl + key, F5, F12; F11 / Alt+Enter toggle fullscreen);
+`platform/input_web.cpp` tracks which keys / mouse buttons the engine saw go down, always forwards the key-up of those (it used to drop a key-up that arrived while
+Ctrl or Cmd was held, e.g. letting go of W while crouching with Ctrl) and never sends one for a key it did not see go down; and it releases everything still held
+when the window blurs or the tab is hidden.
+**Debug overlays are off.** The game data ships `autoexec_dev_mp.cfg` (`set com_statmon 1`, ...), which the engine runs at start-up and again on every profile
+switch: it drew the red stats block top right, the FPS / file-access warning icons left of centre and a memory-budget line ("min pc sound"). `Com_RunAutoExec`
+(src/qcommon/common.cpp, KISAK_WEB block) now sets `com_statmon 0`, `cg_drawFPS 0` and `cg_drawVersion 0` after it. Turn them on again in the console
+(`cg_drawFPS 1`; 2 and 3 add renderer counters; `com_statmon 1`; `cg_drawVersion 1`) or for a session with `?args=%2Bset%20cg_drawFPS%201` (command-line
+settings are applied after the autoexec). A saved `cg_drawFPS` is reset to off at every start, so the console setting lasts for the session only.
 URL options: `?args=--nosound` (skip the audio mixer), `?args=--gldebug` (check GL errors after every draw), `?args=--trace-fs`, and any engine command line, e.g.
 `?args=%2Bset%20developer%200`. The dev server (`web/tools/serve.py`) adds the COOP/COEP headers that wasm threads need
 and serves the install dir read-only under `/data/` (never copied or uploaded).
