@@ -174,13 +174,76 @@ Every tab that opens the game connects to it and is assigned a virtual address, 
   `http://192.168.x.y:8080` page cannot run the game. Either
   - give the server a certificate the client trusts: `mkcert 192.168.1.100 my-mac.local`, then
     `web/run.sh --lan --tls-cert <cert.pem> --tls-key <key.pem>` (HTTPS and `wss://` on the same certificate; the client needs mkcert's root CA
-    installed; a self-signed certificate you click through is *not* a secure context), or
+    installed; a self-signed certificate you click through is *not* a secure context),
+  - or, when players cannot install a root CA (Windows machines, phones), a real certificate for a domain of yours that points at the server's
+    LAN address: [Trusted HTTPS for everyone on the LAN](#trusted-https-for-everyone-on-the-lan-your-own-domain--lets-encrypt), or
   - in Chrome on the client open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add `http://192.168.x.y:8080`, relaunch.
   `--lan` serves your game data to everyone who can reach the port: use it on a network you trust, not through a public tunnel. A phone also lacks
   touch controls (keyboard + mouse only). Another computer without these steps can still reach it through `ssh -N -L 8080:localhost:8080
   -L 8081:localhost:8081 <this-mac>`: its browser then sees `localhost`.
 - **Query a server** (works from anything that can speak WebSocket, e.g. a script): `getinfo`/`getstatus` out-of-band packets, see `tools/relay.py`'s
   `SimpleClient`. LAN broadcast (`255.255.255.255`) is forwarded to every other tab by the relay; that is what the in-game LAN browser sends.
+
+### Trusted HTTPS for everyone on the LAN (your own domain + Let's Encrypt)
+mkcert makes every client install its root CA first, which is a chore on Windows and phones. A certificate from a public CA needs nothing on the
+client, but it is issued for a *name*, to whoever controls that name's DNS. So: use a domain you own, point a name under it at the server's
+**private** LAN address, and prove ownership with a DNS challenge (DNS-01: a TXT record, no inbound connection from the internet). The server never
+becomes reachable from outside; only players on that network can resolve to something they can reach. The steps below use `cod.example.com` and a
+server at `192.168.1.125`; replace both.
+
+1. **DNS record.** In the domain's DNS zone add an `A` record `cod.example.com` -> `192.168.1.125`, **DNS only**: no proxy/CDN in front (Cloudflare's
+   orange cloud, CloudFront, a load balancer), the name must resolve straight to the private address. Give the server a fixed LAN address (a DHCP
+   reservation in the router) so the record stays right.
+2. **Certificate (Let's Encrypt, DNS-01).** Any ACME client works; this one is certbot with the Route 53 plugin (AWS is used for DNS only, see the note
+   below). The domain can be registered anywhere as long as its zone is in Route 53 (or use another provider's certbot plugin, e.g.
+   `certbot-dns-cloudflare`).
+   - Create an IAM user for certbot that can change records in that one zone, so a leaked key can do little else:
+     ```json
+     { "Version": "2012-10-17", "Statement": [
+       { "Effect": "Allow", "Action": ["route53:ListHostedZones", "route53:GetChange"], "Resource": "*" },
+       { "Effect": "Allow", "Action": ["route53:ChangeResourceRecordSets"], "Resource": "arn:aws:route53:::hostedzone/<YOUR-ZONE-ID>" } ] }
+     ```
+     Give certbot its access key with `aws configure` or the environment variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Keep the key out
+     of the repository, the bundle and chat.
+   - Install and issue it (the three `--*-dir` options keep everything under your home directory, so no `sudo`; without them certbot writes to
+     `/etc/letsencrypt`, which only root can read, and `serve.py` would need root to load the key):
+     ```bash
+     python3 -m venv ~/certbot-venv && ~/certbot-venv/bin/pip install certbot certbot-dns-route53
+     ~/certbot-venv/bin/certbot certonly --dns-route53 -d cod.example.com \
+         --config-dir ~/letsencrypt --work-dir ~/letsencrypt/work --logs-dir ~/letsencrypt/logs
+     ```
+     It asks once for an e-mail address and to accept the Let's Encrypt terms, adds the `_acme-challenge` TXT record, waits for the check and removes
+     it. The result is `~/letsencrypt/live/cod.example.com/fullchain.pem` and `privkey.pem` (copy them elsewhere if you like: they are plain PEM files).
+   - A DNS host without a certbot plugin works too, by hand: `certbot certonly --manual --preferred-challenges dns -d cod.example.com` tells you which
+     TXT record to add. Renewals are then manual as well.
+3. **Run it** with the certificate and the name:
+   ```bash
+   web/run.sh --dedicated --lan \
+       --tls-cert ~/letsencrypt/live/cod.example.com/fullchain.pem \
+       --tls-key  ~/letsencrypt/live/cod.example.com/privkey.pem \
+       --allow-origin cod.example.com
+   ```
+   `--allow-origin` is required: with `--lan` the relay accepts pages from localhost, `*.local` and private IP *literals* only (it never resolves a public
+   name, which would be a DNS-rebinding hole), so a domain has to be listed explicitly. Without it the relay answers `403` and prints
+   `[relay] refused origin https://cod.example.com:8080`; the game page still loads, but its engine cannot reach the relay, so no server is listed.
+   Players open **`https://cod.example.com:8080/`** (by the name: the certificate does not cover the IP address) and use **Join Game**. Ports 8080 (page and
+   game data) and 8081 (relay, `wss://`) must be reachable on the server (allow `python3` through the macOS firewall prompt, or open both in `ufw`).
+4. **Renew.** The certificate lasts 90 days and `serve.py` reads the files only at start, so renew and restart, e.g. weekly from cron/launchd:
+   `~/certbot-venv/bin/certbot renew --quiet --config-dir ~/letsencrypt --work-dir ~/letsencrypt/work --logs-dir ~/letsencrypt/logs --deploy-hook "<command that restarts serve.py>"`
+   (`renew` does nothing until the certificate is within 30 days of expiry; the hook runs only when it was renewed).
+
+Troubleshooting and caveats:
+- **The name does not resolve on the LAN** (`dig +short cod.example.com` / `nslookup` shows nothing): many routers and DNS filters (dnsmasq's
+  `stop-dns-rebind`, OpenWrt, FRITZ!Box, pfSense, Pi-hole) drop public answers that point at private addresses ("DNS rebinding protection"). Add the
+  domain to the router's exception list, or give the LAN's DNS an override for it.
+- **The page opens but the game will not start:** the browser does not trust the certificate (opened by IP, name mismatch, expired). The padlock
+  must be clean; check `https://cod.example.com:8080/` and the expiry date.
+- **Keep `privkey.pem` private** (`chmod 600`): anyone with it can impersonate the name. `package_server.py` never includes it.
+- **AWS is for DNS and the IAM user only.** Do not run the game server or serve the game data from EC2, CloudFront or a load balancer: the data is
+  commercial and this project never hosts it publicly (`--lan` is for networks you trust). AWS Certificate Manager is no substitute: its public
+  certificates cannot be exported, so `serve.py` could not load one.
+- The record exposes the server's private address in public DNS (harmless, but visible). Players outside the network get an address they cannot
+  reach; for friends elsewhere use a VPN (Tailscale, WireGuard) and the same name.
 
 ### Ping / latency
 The scoreboard ping is the server's own measure (`SV_CalcPings`): the time from sending a snapshot until the first usercmd packet that acknowledges
@@ -248,7 +311,8 @@ python3 web/tools/package_server.py                                             
 ```
 - **Needs** node 22 or newer (its global `WebSocket` is the relay transport) and python3. The machine that serves does not need emscripten.
   Players open `http://<machine>:8080/` and use **Join Game** (source Local lists it as "KisakCoD4 web server"), or `connect 10.77.0.1`.
-  `--lan` and the secure-origin requirement are the same as for a hosting tab (see Multiplayer): give the server a certificate the players trust.
+  `--lan` and the secure-origin requirement are the same as for a hosting tab (see Multiplayer): give the server a certificate the players trust
+  (for a LAN with Windows players the easiest is a domain + Let's Encrypt certificate, [steps here](#trusted-https-for-everyone-on-the-lan-your-own-domain--lets-encrypt)).
   With TLS the game server itself connects to the relay through a plain loopback-only listener, so it never needs the certificate.
 - **Settings:** `dedicated/server.cfg` (name, slots, game type, scores, map rotation; it is run as `exec server.cfg` before the first map).
   `--dedicated-cfg FILE` picks another one, `--dedicated-args "+set sv_hostname Foo +set g_gametype dm"` adds engine arguments (they win over the file).
