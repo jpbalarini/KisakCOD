@@ -257,6 +257,10 @@ Troubleshooting and caveats:
   domain to the router's exception list, or give the LAN's DNS an override for it.
 - **The page opens but the game will not start:** the browser does not trust the certificate (opened by IP, name mismatch, expired). The padlock
   must be clean; check `https://cod.example.com:8080/` and the expiry date.
+- **A client typed `http://...:8080` (or `http://<ip>:8080`):** the port is https only, but `serve.py` answers a plain-http request with a redirect to
+  `https://cod.example.com:8080/...` (the certificate's name, also when the client used the IP) rather than an `SSL: HTTP_REQUEST` error. The `wss://`
+  relay port (8081) has no such redirect; the page connects to it itself.
+  A one-line `[serve] <ip>: TLS error: ... CERTIFICATE_UNKNOWN / UNKNOWN_CA` in the log means that client does not trust the certificate.
 - **Keep `privkey.pem` private** (`chmod 600`): anyone with it can impersonate the name. `package_server.py` never includes it.
 - **AWS is for DNS and the IAM user only.** Do not run the game server or serve the game data from EC2, CloudFront or a load balancer: the data is
   commercial and this project never hosts it publicly (`--lan` is for networks you trust). AWS Certificate Manager is no substitute: its public

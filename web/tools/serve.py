@@ -15,7 +15,9 @@ The game data is never copied or uploaded anywhere. By default it is only served
 the local network (see below) so other computers and phones can play.
 
   --lan                          listen on all interfaces; the relay also accepts pages served from private-network addresses
-  --tls-cert FILE --tls-key FILE serve https:// and wss:// (e.g. a certificate made with `mkcert 192.168.1.100 my-mac.local`)
+  --tls-cert FILE --tls-key FILE serve https:// and wss:// (e.g. a certificate made with `mkcert 192.168.1.100 my-mac.local`); a plain
+                                 http:// request to the same port is redirected to https:// (at the certificate's name when the client used
+                                 an IP address) instead of failing with 'SSL: HTTP_REQUEST'
   --allow-origin ORIGIN          let one more page origin/host use the relay (repeatable)
 
   --dedicated                    also run the headless dedicated game server (the engine under node, web/build/dedicated, no browser tab
@@ -28,9 +30,9 @@ Browsers only enable SharedArrayBuffer (wasm threads) and AudioWorklet in a *sec
 http://192.168.x.y:8080 page therefore cannot run the game. Either use --tls-cert/--tls-key with a certificate the client trusts, or, in
 Chrome on the client, open chrome://flags/#unsafely-treat-insecure-origin-as-secure and add the http://192.168.x.y:8080 origin.
 """
-import argparse, atexit, json, mimetypes, os, re, shlex, shutil, signal, socket, ssl, subprocess, sys, threading, time
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import unquote, urlparse
+import argparse, atexit, ipaddress, json, mimetypes, os, re, shlex, shutil, signal, socket, ssl, subprocess, sys, threading, time
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler, BaseHTTPRequestHandler
+from urllib.parse import quote, unquote, urlparse, urlsplit
 
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
@@ -70,6 +72,118 @@ def get_manifest():
 class Server(ThreadingHTTPServer):
     request_queue_size = 128      # the default backlog (5) overflows when a browser opens several connections at once: dropped SYNs retry after 1 s
     daemon_threads = True
+    ssl_ctx = None                # set: this is the https:// port (see finish_request)
+    cert_names = ()               # the DNS names of that certificate, for the http:// -> https:// redirect
+
+    def finish_request(self, request, client_address):
+        """Runs in the per-connection thread (so one stalled client cannot block accept(); the TLS handshake also happens here, lazily on the
+        first read). On the https port the first byte tells the protocols apart: 0x16 is a TLS ClientHello; anything else is a client that
+        typed or bookmarked http://host:port/. Left to the TLS layer that client would get 'SSL: HTTP_REQUEST' and a dead connection."""
+        if self.ssl_ctx is None:
+            return super().finish_request(request, client_address)
+        first = request.recv(1, socket.MSG_PEEK)
+        if first == b"\x16":
+            tls = self.ssl_ctx.wrap_socket(request, server_side=True, do_handshake_on_connect=False)   # detaches `request`
+            try:
+                self.RequestHandlerClass(tls, client_address, self)
+            finally:
+                try:
+                    tls.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                tls.close()
+        elif first:
+            RedirectHandler(request, client_address, self)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ssl.SSLError):
+            # most often a client that does not trust the certificate (SSLV3_ALERT_CERTIFICATE_UNKNOWN): worth one line, not a traceback
+            sys.stderr.write(f"[serve] {client_address[0]}: TLS error: {exc}\n")
+        elif isinstance(exc, (ConnectionError, TimeoutError)):      # a client that went away (browsers drop speculative connections all the time)
+            if ARGS.verbose:
+                sys.stderr.write(f"[serve] {client_address[0]}: {exc}\n")
+        else:
+            super().handle_error(request, client_address)
+
+
+def cert_names(path):
+    """The DNS names a PEM certificate is valid for (its subjectAltName); [] when they cannot be read."""
+    try:
+        info = ssl._ssl._test_decode_cert(path)
+        return [v.lower() for k, v in info.get("subjectAltName", ()) if k == "DNS"]
+    except Exception:
+        return []
+
+
+def host_matches(pattern, host):
+    if pattern.startswith("*."):          # a wildcard covers exactly one label
+        return host.count(".") == pattern.count(".") and host.endswith(pattern[1:])
+    return pattern == host
+
+
+HOSTNAME = re.compile(r"^(?:[a-z0-9-]{1,63}\.)*[a-z0-9-]{1,63}$")
+
+
+def is_host(h):
+    if not h or "%" in h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return bool(HOSTNAME.match(h))
+
+
+class RedirectHandler(BaseHTTPRequestHandler):
+    """Answers a plain http:// request that reached the https port with a redirect to the same page over https://.
+
+    The target host is the one the client used if the certificate covers it; otherwise (an IP address, or a name the certificate does not
+    cover) the certificate's own name, since https://192.168.x.y would only trade this problem for a certificate-mismatch page. The Host
+    header is never echoed unless it passes that check, and only the path and query of the request line are carried over."""
+    protocol_version = "HTTP/1.1"
+    timeout = 10          # a client that connects and never sends its request line
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[serve] {self.address_string()} plain http on the https port: " + (fmt % args) + "\n")
+
+    def https_url(self):
+        names = self.server.cert_names
+        try:
+            u = urlsplit("//" + (self.headers.get("Host") or ""))
+            host, port = u.hostname, u.port
+        except ValueError:
+            host = port = None
+        if not (host and any(host_matches(n, host) for n in names)):
+            host = next((n for n in names if not n.startswith("*")), host if is_host(host) else None)
+        if not host:
+            return None
+        port = port or self.server.server_address[1]
+        try:
+            target = urlsplit(self.path)
+        except ValueError:
+            target = urlsplit("/")
+        path = target.path if target.path.startswith("/") else "/"
+        url = "https://" + (f"[{host}]" if ":" in host else host) + ("" if port == 443 else f":{port}") + quote(path, safe="/%:@!$&'()*+,;=~-._")
+        return url + ("?" + quote(target.query, safe="/%:@!$&'()*+,;=?~-._") if target.query else "")
+
+    def redirect(self):
+        url = self.https_url()
+        if not url:
+            self.send_error(400, "This port serves https only", "Open it with an https:// URL.")
+            return
+        body = f'<a href="{url}">{url}</a>\n'.encode()
+        self.send_response(307)
+        self.send_header("Location", url)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = redirect
 
 
 TRACE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -533,8 +647,10 @@ def main():
                                         bots=os.path.abspath(ARGS.dedicated_bots) if ARGS.dedicated_bots and os.path.isdir(ARGS.dedicated_bots) else "")
     httpd = Server((bind, ARGS.port), Handler)
     if ssl_ctx:
-        # handshake lazily in the per-connection handler thread so one stalled client cannot block accept()
-        httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+        # not wrapped here: Server.finish_request tells TLS from plain http by the first byte, in the per-connection thread
+        httpd.ssl_ctx = ssl_ctx
+        httpd.cert_names = cert_names(ARGS.tls_cert)
+        print(f"[serve] a plain http:// request to this port is redirected to https://{next((n for n in httpd.cert_names if not n.startswith('*')), '<host>')}:{ARGS.port}/", flush=True)
     if ARGS.lan:
         ips = lan_addresses()
         print("[serve] --lan: reachable from the local network (the game data is served to anyone who can reach this port):", flush=True)
