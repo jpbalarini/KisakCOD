@@ -1774,6 +1774,10 @@ ShadowType __cdecl R_DynamicShadowType()
         return sc_enable->current.enabled ? SHADOW_COOKIE : SHADOW_NONE;
 }
 
+#ifdef KISAK_WEB
+extern "C" int kisak_ssao_wanted(void);   // web/platform/ssao_web.cpp
+#endif
+
 void __cdecl R_SetDepthOfField(GfxViewInfo *viewInfo, const GfxSceneParms *sceneParms)
 {
     Font_s *font; // [esp+24h] [ebp-4h]
@@ -1826,6 +1830,11 @@ void __cdecl R_SetDepthOfField(GfxViewInfo *viewInfo, const GfxSceneParms *scene
             R_AddCmdDrawText((char*)"DOF", 0x7FFFFFFF, font, 0.0, 320.0, 1.5, 2.0, 0.0, colorRedFaded, 0);
         }
     }
+#ifdef KISAK_WEB
+    // Web SSAO (web/platform/ssao_web.cpp) reads the float-z target: make this view build it.
+    if (gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].surface.color && kisak_ssao_wanted())
+        viewInfo->needsFloatZ = 1;
+#endif
 }
 
 void __cdecl R_SetFilmInfo(GfxViewInfo *viewInfo, const GfxSceneParms *sceneParms)

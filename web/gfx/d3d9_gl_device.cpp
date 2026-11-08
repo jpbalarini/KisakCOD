@@ -28,6 +28,7 @@ static int g_activeUnit = 0;
 static const int kScratchUnit = 31;
 struct Device;
 static Device *g_device = nullptr;
+extern "C" int kisak_ssao_params(float *out);    // web/platform/ssao_web.cpp: 0 = SSAO off, else radius, strength, bias, debug mode, blur on/off
 
 void Log(const char *fmt, ...)
 {
@@ -892,6 +893,218 @@ struct Device : RefImpl<IDirect3DDevice9> {
     }
     HRESULT __stdcall Present(const RECT *, const RECT *, HWND, const void *) override { return presentFrame(); }
 
+    // ---------------------------------------------------------------- SSAO (web/platform/ssao_web.cpp has the dvars and the story)
+    // Called by the engine (rb_draw3d.cpp, kisak_ssao_apply) after the lit scene is drawn: multiplies an occlusion factor into the colour
+    // target that is currently bound, computed from the engine's float-z texture (R32F, linear view depth, same orientation and size as the
+    // scene target). Depth only: the normal is rebuilt from depth differences, 16 rotated samples per pixel, no blur (yet).
+    GLuint ssaoProg = 0, ssaoVao = 0, ssaoSamp = 0; GLint ssaoU[3] = {-1, -1, -1}; bool ssaoFailed = false;
+    // depth-aware separable blur of the occlusion (r_webSSAOBlur): AO -> aoTex[0], horizontal -> aoTex[1], vertical + multiply into the scene
+    GLuint blurProg = 0, aoTex[2] = {0, 0}, aoFbo[2] = {0, 0}; GLint blurU[2] = {-1, -1}; GLint aoW = 0, aoH = 0; bool blurFailed = false;
+    static constexpr int kAoUnit = 30;   // texture unit for the AO texture (kScratchUnit = 31 holds the float-z)
+
+    bool buildBlurProgram()
+    {
+        static const char *vs =
+            "#version 300 es\n"
+            "void main() { vec2 q = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(q * 2.0 - 1.0, 0.0, 1.0); }\n";
+        static const char *fs =
+            "#version 300 es\n"
+            "precision highp float; precision highp int;\n"
+            "uniform highp sampler2D uZ;\n"
+            "uniform highp sampler2D uAO;\n"
+            "uniform vec4 uR;     // viewport x, y, w, h (taps are clamped to it)\n"
+            "uniform vec2 uDir;   // (1,0) horizontal, (0,1) vertical\n"
+            "out vec4 o;\n"
+            "void main() {\n"
+            "  ivec2 zs = textureSize(uZ, 0);\n"
+            "  ivec2 lo = ivec2(uR.xy), hi = ivec2(uR.xy + uR.zw) - 1;\n"
+            "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "  float z0 = texelFetch(uZ, clamp(p, ivec2(0), zs - 1), 0).r;\n"
+            "  float ao0 = texelFetch(uAO, clamp(p, lo, hi), 0).r;\n"
+            "  if (!(z0 > 1.0 && z0 < 30000.0)) { o = vec4(vec3(ao0), 1.0); return; }   // no geometry: pass through\n"
+            "  float s = 0.02 * z0 + 1.0;   // depth tolerance grows with distance, so a slanted wall still blurs along itself\n"
+            "  float sum = 0.0, ws = 0.0;\n"
+            "  for (int i = -4; i <= 4; ++i) {\n"
+            "    ivec2 q = clamp(p + ivec2(uDir) * i, lo, hi);\n"
+            "    float d = (texelFetch(uZ, clamp(q, ivec2(0), zs - 1), 0).r - z0) / s;\n"
+            "    float w = exp(-float(i * i) / 8.0) * exp(-d * d);\n"
+            "    sum += texelFetch(uAO, q, 0).r * w; ws += w;\n"
+            "  }\n"
+            "  o = vec4(vec3(sum / ws), 1.0);\n"
+            "}\n";
+        GLuint v = compile(GL_VERTEX_SHADER, vs, "ssao blur vertex"), f = compile(GL_FRAGMENT_SHADER, fs, "ssao blur fragment");
+        if (!v || !f) return false;
+        blurProg = glCreateProgram();
+        glAttachShader(blurProg, v); glAttachShader(blurProg, f);
+        glLinkProgram(blurProg);
+        GLint ok = 0; glGetProgramiv(blurProg, GL_LINK_STATUS, &ok);
+        glDeleteShader(v); glDeleteShader(f);
+        if (!ok) {
+            char log[2048]; GLsizei n = 0; glGetProgramInfoLog(blurProg, sizeof log, &n, log);
+            Log("ssao blur program link failed: %s", log); glDeleteProgram(blurProg); blurProg = 0; return false;
+        }
+        glUseProgram(blurProg);
+        glUniform1i(glGetUniformLocation(blurProg, "uZ"), kScratchUnit);
+        glUniform1i(glGetUniformLocation(blurProg, "uAO"), kAoUnit);
+        blurU[0] = glGetUniformLocation(blurProg, "uR"); blurU[1] = glGetUniformLocation(blurProg, "uDir");
+        return true;
+    }
+
+    void ensureAoTargets(GLint w, GLint h)
+    {
+        if (aoTex[0] && aoW == w && aoH == h) return;
+        if (aoTex[0]) { glDeleteTextures(2, aoTex); glDeleteFramebuffers(2, aoFbo); }
+        glGenTextures(2, aoTex); glGenFramebuffers(2, aoFbo);
+        glActiveTexture(GL_TEXTURE0 + kAoUnit); g_activeUnit = kAoUnit;
+        for (int i = 0; i < 2; ++i) {
+            glBindTexture(GL_TEXTURE_2D, aoTex[i]);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, w, h);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, aoFbo[i]);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, aoTex[i], 0);
+        }
+        aoW = w; aoH = h;
+        curFbo = {{~0u, ~0u, ~0u, ~0u}, ~0u};   // we changed the bound framebuffer behind applyRenderTargets()'s back
+    }
+
+    void applySSAO(float xScale, float yScale, IDirect3DBaseTexture9 *zbase)
+    {
+        float p[5];
+        // (Without antialiasing the engine draws the scene straight into the backbuffer, so that is a valid target here.)
+        if (ssaoFailed || !zbase || !rt[0] || !kisak_ssao_params(p)) return;
+        Texture2D *zt = static_cast<Texture2D *>(static_cast<IDirect3DTexture9 *>(zbase));
+        if (rt[0]->w != zt->core.w || rt[0]->h != zt->core.h || (rt[0]->kind == Surface::K_TEXLEVEL && rt[0]->tex == &zt->core)) return;
+        if (!ssaoProg) {
+            static const char *vs =
+                "#version 300 es\n"
+                "void main() { vec2 q = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(q * 2.0 - 1.0, 0.0, 1.0); }\n";
+            static const char *fs =
+                "#version 300 es\n"
+                "precision highp float; precision highp int;\n"
+                "uniform highp sampler2D uZ;\n"
+                "uniform vec4 uP;   // radius, strength, bias, debug\n"
+                "uniform vec4 uV;   // xScale, yScale, viewport w, h\n"
+                "uniform vec4 uO;   // viewport x, y, (unused)\n"
+                "out vec4 o;\n"
+                "const float kFar = 30000.0;   // float-z values at or past this are 'no geometry' (sky)\n"
+                "ivec2 zsize;\n"
+                "float Z(ivec2 p) { return texelFetch(uZ, clamp(p, ivec2(0), zsize - 1), 0).r; }\n"
+                "vec3 viewPos(vec2 pix, float z) {   // pix = absolute texel position (centre = +0.5); y up, z = distance along the view axis\n"
+                "  vec2 n = (pix - uO.xy) / uV.zw * 2.0 - 1.0;\n"
+                "  return vec3(n.x / uV.x * z, -n.y / uV.y * z, z);\n"
+                "}\n"
+                "void main() {\n"
+                "  zsize = textureSize(uZ, 0);\n"
+                "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+                "  float z = Z(p);\n"
+                "  int dbg = int(uP.w + 0.5);\n"
+                "  if (dbg == 1) { o = vec4(vec3(clamp(z / 1500.0, 0.0, 1.0)), 1.0); return; }\n"
+                "  float ao = 1.0;\n"
+                "  if (z > 1.0 && z < kFar) {\n"
+                "    vec2 c = vec2(p) + 0.5;\n"
+                "    vec3 P = viewPos(c, z);\n"
+                "    float zl = Z(p + ivec2(-1, 0)), zr = Z(p + ivec2(1, 0)), zu = Z(p + ivec2(0, -1)), zd = Z(p + ivec2(0, 1));\n"
+                "    vec3 dx = abs(zr - z) < abs(z - zl) ? viewPos(c + vec2(1.0, 0.0), zr) - P : P - viewPos(c - vec2(1.0, 0.0), zl);\n"
+                "    vec3 dy = abs(zd - z) < abs(z - zu) ? viewPos(c + vec2(0.0, 1.0), zd) - P : P - viewPos(c - vec2(0.0, 1.0), zu);\n"
+                "    vec3 N = normalize(cross(dx, dy));\n"
+                "    if (dot(N, P) > 0.0) N = -N;   // face the camera\n"
+                "    float R = uP.x;\n"
+                "    float rpx = clamp(R * uV.x / z * uV.z * 0.5, 3.0, 96.0);\n"
+                "    float ang = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+                "    float occ = 0.0;\n"
+                "    for (int i = 0; i < 16; ++i) {\n"
+                "      float r = sqrt((float(i) + 0.5) / 16.0) * rpx;\n"
+                "      float a = ang + float(i) * 2.39996323;\n"
+                "      ivec2 q = ivec2(c + vec2(cos(a), sin(a)) * r);\n"
+                "      float zs = Z(q);\n"
+                "      if (zs <= 1.0 || zs >= kFar) continue;\n"
+                "      vec3 v = viewPos(vec2(q) + 0.5, zs) - P;\n"
+                "      float len = length(v);\n"
+                "      float nd = dot(N, v) / max(len, 1e-3);\n"
+                "      occ += max(nd - uP.z, 0.0) * (1.0 - smoothstep(0.35 * R, R, len));\n"
+                "    }\n"
+                "    ao = 1.0 - clamp(uP.y * 2.0 * occ / 16.0, 0.0, 1.0);\n"
+                "    if (dbg == 3) { o = vec4(N * 0.5 + 0.5, 1.0); return; }                  // reconstructed normal\n"
+                "    if (dbg == 4) { o = vec4(vec3(1.0 - clamp(occ / 16.0 * 8.0, 0.0, 1.0)), 1.0); return; }   // raw occlusion x8\n"
+                "  }\n"
+                "  if (dbg == 3 || dbg == 4) { o = vec4(1.0, 0.0, 1.0, 1.0); return; }   // magenta = pixel skipped (no depth)\n"
+                "  o = vec4(vec3(ao), 1.0);\n"
+                "}\n";
+            GLuint v = compile(GL_VERTEX_SHADER, vs, "ssao vertex"), f = compile(GL_FRAGMENT_SHADER, fs, "ssao fragment");
+            if (!v || !f) { ssaoFailed = true; return; }
+            ssaoProg = glCreateProgram();
+            glAttachShader(ssaoProg, v); glAttachShader(ssaoProg, f);
+            glLinkProgram(ssaoProg);
+            GLint ok = 0; glGetProgramiv(ssaoProg, GL_LINK_STATUS, &ok);
+            glDeleteShader(v); glDeleteShader(f);
+            if (!ok) {
+                char log[2048]; GLsizei n = 0; glGetProgramInfoLog(ssaoProg, sizeof log, &n, log);
+                Log("ssao program link failed: %s", log); glDeleteProgram(ssaoProg); ssaoProg = 0; ssaoFailed = true; return;
+            }
+            glUseProgram(ssaoProg);
+            glUniform1i(glGetUniformLocation(ssaoProg, "uZ"), kScratchUnit);
+            ssaoU[0] = glGetUniformLocation(ssaoProg, "uP"); ssaoU[1] = glGetUniformLocation(ssaoProg, "uV"); ssaoU[2] = glGetUniformLocation(ssaoProg, "uO");
+            glGenVertexArrays(1, &ssaoVao);
+            glGenSamplers(1, &ssaoSamp);
+            glSamplerParameteri(ssaoSamp, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glSamplerParameteri(ssaoSamp, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glSamplerParameteri(ssaoSamp, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glSamplerParameteri(ssaoSamp, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            Log("SSAO pass ready");
+        }
+        zt->core.ensureGL();
+        if (!zt->core.tex) return;
+        const int dbg = (int)(p[3] + 0.5f);
+        bool blur = p[4] > 0.5f && !blurFailed && (dbg == 0 || dbg == 2);   // depth / normal / raw-occlusion views are never blurred
+        if (blur && !blurProg && !buildBlurProgram()) { blurFailed = true; blur = false; }
+        if (blur) ensureAoTargets((GLint)zt->core.w, (GLint)zt->core.h);
+        const GLint vx = (GLint)vp.X, vy = (GLint)vp.Y; const GLsizei vw = (GLsizei)vp.Width, vh = (GLsizei)vp.Height;
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glActiveTexture(GL_TEXTURE0 + kScratchUnit); g_activeUnit = kScratchUnit;
+        glBindTexture(GL_TEXTURE_2D, zt->core.tex);
+        glBindSampler(kScratchUnit, ssaoSamp);
+        glBindVertexArray(ssaoVao);
+        auto setAoUniforms = [&] {
+            glUseProgram(ssaoProg);
+            glUniform4f(ssaoU[0], p[0], p[1], p[2], p[3]);
+            glUniform4f(ssaoU[1], xScale, yScale, (float)vp.Width, (float)vp.Height);
+            glUniform4f(ssaoU[2], (float)vp.X, (float)vp.Y, 0.f, 0.f);
+        };
+        if (blur) {
+            // pass A: occlusion -> aoTex[0]
+            glBindFramebuffer(GL_FRAMEBUFFER, aoFbo[0]); glDisable(GL_BLEND); glViewport(vx, vy, vw, vh);
+            setAoUniforms(); glDrawArrays(GL_TRIANGLES, 0, 3);
+            // pass B: horizontal blur aoTex[0] -> aoTex[1]
+            glBindFramebuffer(GL_FRAMEBUFFER, aoFbo[1]);
+            glActiveTexture(GL_TEXTURE0 + kAoUnit); g_activeUnit = kAoUnit;
+            glBindTexture(GL_TEXTURE_2D, aoTex[0]); glBindSampler(kAoUnit, ssaoSamp);
+            glUseProgram(blurProg);
+            glUniform4f(blurU[0], (float)vp.X, (float)vp.Y, (float)vp.Width, (float)vp.Height); glUniform2f(blurU[1], 1.f, 0.f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            // pass C: vertical blur aoTex[1] -> the engine's colour target, multiplied in (dbg 2 overwrites instead)
+            curFbo = {{~0u, ~0u, ~0u, ~0u}, ~0u};
+            applyRenderTargets();
+            if (dbg == 2) glDisable(GL_BLEND);
+            else { glEnable(GL_BLEND); glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE); }
+            glViewport(vx, vy, vw, vh);
+            glBindTexture(GL_TEXTURE_2D, aoTex[1]);
+            glUniform2f(blurU[1], 0.f, 1.f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindSampler(kAoUnit, 0);
+        } else {
+            applyRenderTargets();   // bind the colour target the engine has selected
+            if (dbg > 0) glDisable(GL_BLEND);   // debug views overwrite the scene
+            else { glEnable(GL_BLEND); glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); glBlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE); }
+            glViewport(vx, vy, vw, vh);
+            setAoUniforms(); glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glBindVertexArray(vao);
+        glBindSampler(kScratchUnit, 0);
+        // the normal draw path keeps its own copy of this state: force it to be re-applied
+        gl.program = ~0u; gl.depthTest = gl.cull = gl.blend = gl.stencil = gl.colorMask = gl.sepBlend = -1; gl.scissor = 0;
+        gl.vpx = gl.vpy = gl.vpw = gl.vph = -1;
+        gl.sfactor = gl.dfactor = gl.sfactorA = gl.dfactorA = gl.eq = gl.eqA = 0;
+    }
+
     HRESULT __stdcall GetBackBuffer(UINT, UINT, D3DBACKBUFFER_TYPE, IDirect3DSurface9 **surf) override
     {
         *surf = backbuffer; backbuffer->AddRef(); return D3D_OK;
@@ -1418,6 +1631,12 @@ struct D3D9Impl : RefImpl<IDirect3D9> {
 };
 
 } // namespace d3dgl
+
+// Engine entry point (src/gfx_d3d/rb_draw3d.cpp, KISAK_WEB): xScale / yScale are projectionMatrix[0][0] / [1][1], the texture is the float-z image.
+extern "C" void kisak_ssao_apply(float xScale, float yScale, void *floatZTexture)
+{
+    if (d3dgl::g_device) d3dgl::g_device->applySSAO(xScale, yScale, static_cast<IDirect3DBaseTexture9 *>(floatZTexture));
+}
 
 extern "C++" IDirect3D9 *Direct3DCreate9(UINT)
 {

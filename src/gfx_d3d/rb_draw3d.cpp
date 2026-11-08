@@ -341,6 +341,10 @@ void __cdecl R_DrawDebugShaderDecalCallback(const void *data, GfxCmdBufContext c
     R_DrawSurfs(context, 0, &((const GfxViewInfo*)data)->decalInfo);
 }
 
+#ifdef KISAK_WEB
+extern "C" void kisak_ssao_apply(float xScale, float yScale, void *floatZTexture);   // web/gfx/d3d9_gl_device.cpp
+#endif
+
 void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
 {
     GfxRenderTargetId setupRenderTargetId; // [esp+44h] [ebp-2Ch]
@@ -435,6 +439,13 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
         R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_SCENE);
         R_Resolve(gfxCmdBufContext, gfxRenderTargets[R_RENDERTARGET_RESOLVED_POST_SUN].image);
     }
+#ifdef KISAK_WEB
+    // Web SSAO: multiply an occlusion term into the scene colour, from the float-z depth (web/platform/ssao_web.cpp, Device::applySSAO).
+    // Before emissive effects (smoke, fire, glass), glow, depth of field and the HUD, so those are not darkened.
+    if (viewInfo->needsFloatZ && R_HaveFloatZ())
+        kisak_ssao_apply(viewInfo->viewParms.projectionMatrix.m[0][0], viewInfo->viewParms.projectionMatrix.m[1][1],
+                         gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].image ? gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].image->texture.basemap : nullptr);
+#endif
     R_InitContext(data, &cmdBuf);
     KISAK_NULLSUB();
     R_DrawEmissive(viewInfo, &cmdBuf);
