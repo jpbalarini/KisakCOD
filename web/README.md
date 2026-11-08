@@ -138,6 +138,18 @@ particle material is soft-edged, i.e. fire / smoke; `r_zFeather 0` removes it an
 main scene (~760). `+set sm_enable 0` drops the sun shadow pass at any time. Draw calls are the cost unit in this browser path (~5-15 us each in the GPU process),
 not triangles or pixels (3 indices per draw and a 1x1 viewport left the frame time unchanged).
 
+**SSAO (screen-space ambient occlusion).** Built on the engine's own float-z pass, so there is no new geometry code: while `r_webSSAO` is on, `R_SetDepthOfField`
+(`src/gfx_d3d/r_scene.cpp`, `KISAK_WEB` block) forces `needsFloatZ` for the view, and `RB_StandardDrawCommands` (`rb_draw3d.cpp`) calls `kisak_ssao_apply()` once the lit
+scene, decals and lights are drawn and *before* emissive effects, glow, depth of field and the HUD, so none of those are darkened. `Device::applySSAO`
+(`gfx/d3d9_gl_device.cpp`) then multiplies an occlusion term into whichever colour target the engine has bound (without antialiasing that is the backbuffer itself).
+Depth only: the normal is rebuilt from depth differences and 16 rotated samples per pixel look around the point within a world-space radius. The occlusion is rendered to
+a texture and blurred with a depth-aware separable blur (taps across a depth edge get no weight, so edges stay sharp), which removes the sampling grain. The pass uses its
+own programs / VAO / FBOs / textures and invalidates the cached GL state it touches. Dvars (`platform/ssao_web.cpp`, live and archived): `r_webSSAO` (0/1),
+`r_webSSAORadius` (world units, default 40), `r_webSSAOStrength` (0..3, default 1), `r_webSSAOBias` (0..1, ignores nearly flat neighbours), `r_webSSAOBlur` (0/1) and
+`r_webSSAODebug` (1 = view depth, 2 = occlusion only, 3 = reconstructed normals with magenta where there is no depth, 4 = raw occlusion x8; the debug views are never blurred).
+Cost: the float-z pass is one extra geometry pass (like soft particles), plus three full-screen passes. Not covered: the viewmodel is not in the float-z target, so the
+gun receives no occlusion; antialiasing, splitscreen and resolutions other than the default window were not tried.
+
 **Profiling** (`?args=--prof`, add `+set com_maxfps 0` to see the uncapped frame time): the page log gets a `[prof]` report every 4 s with the heaviest zones (every engine
 `PROF_SCOPED` span, plus `gl:*` spans of the D3D -> GL layer), per-frame counters (draws, state changes, uploads, draws / triangles / GPU ms per render target: `dr[1024x768 f21]`
 is the main scene, `f114` = R32F: shadow map 1024x2048 and float-z 1024x768), a per-buffer upload table, and a `HITCH` line for every frame over 60 ms (`--prof-hitch=N`).
