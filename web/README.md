@@ -103,6 +103,15 @@ URL options: `?args=--nosound` (skip the audio mixer), `?args=--gldebug` (check 
 and serves the install dir read-only under `/data/` (never copied or uploaded).
 
 
+**Color grade.** The finished frame goes through one small fragment shader on its way to the canvas (`Device::applyGrade` in `gfx/d3d9_gl_device.cpp`, dvars in
+`platform/grade_web.cpp`): the backbuffer is copied into a texture (a renderbuffer cannot be sampled) and drawn to the canvas with an unsharp mask, an exposure
+multiplier, an ACES-style filmic curve (the white point is renormalised so 1.0 stays 1.0), contrast, saturation, a vignette and a 1-LSB dither against banding. It runs
+in LDR after the engine's own glow / depth of field / color manipulation, so it is a *look*, not HDR tone mapping: the scene target is 8 bit, there is nothing brighter
+than 1.0 left to compress. It is on by default with mild values. The dvars are live (console, or `?args=%2Bset%20r_webContrast%201.3`) and archived like other settings:
+`r_webGrade` (0/1, 0 restores the plain blit), `r_webExposure` (0.25..3), `r_webFilmic` (0..1, blend towards the curve), `r_webContrast` (0.5..2), `r_webSaturation`
+(0..2), `r_webVignette` (0..1), `r_webSharpen` (0..1). The pass uses its own program / VAO / FBO / texture and invalidates the cached GL state it touches
+(`gl.program`, blend, depth, viewport, ...); if its shader fails to build, `presentFrame` falls back to the old flipped blit.
+
 ## Performance
 The first browser builds ran at 12-20 fps on an M1 and 12-60 fps on an M5 Max (menus ~12, fire / smoke / shooting worst). Nothing was wrong with the engine
 code: the time went into the browser's **GPU process**, which executes every GL call the engine thread issues (WebGL commands are asynchronous, but a
