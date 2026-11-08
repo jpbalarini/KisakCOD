@@ -14,6 +14,8 @@
 #include <set>
 #include <tuple>
 
+extern "C" int kisak_grade_params(float *out);   // web/platform/grade_web.cpp: 0 = grade off, else exposure, filmic, contrast, saturation, vignette, sharpen
+
 namespace d3dgl {
 
 // ====================================================================== misc globals
@@ -869,6 +871,101 @@ struct Device : RefImpl<IDirect3DDevice9> {
         }
     }
 
+    // ---------------------------------------------------------------- final colour grade (web/platform/grade_web.cpp has the dvars)
+    // Copies the finished backbuffer into a texture (a renderbuffer cannot be sampled) and draws it to the canvas through a small
+    // fragment shader. Uses its own program / VAO / FBO / texture; afterwards the cached GL state this touches is invalidated so the
+    // next frame re-applies it. Returns false when the grade is off or failed, and the caller falls back to the plain flipped blit.
+    GLuint gradeProg = 0, gradeVao = 0, gradeFbo = 0, gradeTex = 0; GLint gradeW = 0, gradeH = 0, gradeU0 = -1, gradeU1 = -1; bool gradeFailed = false;
+
+    bool applyGrade(GLuint readFbo, GLint w, GLint h)
+    {
+        float p[6];
+        if (gradeFailed || !kisak_grade_params(p)) return false;
+        if (!gradeProg) {
+            static const char *vs =
+                "#version 300 es\n"
+                "void main() { vec2 q = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(q * 2.0 - 1.0, 0.0, 1.0); }\n";
+            static const char *fs =
+                "#version 300 es\n"
+                "precision highp float; precision highp int;\n"
+                "uniform highp sampler2D uTex;\n"
+                "uniform vec4 uP0;   // exposure, filmic, contrast, saturation\n"
+                "uniform vec4 uP1;   // vignette, sharpen, width, height\n"
+                "out vec4 o;\n"
+                "vec3 fetch(ivec2 c, int h) { return texelFetch(uTex, ivec2(c.x, h - 1 - c.y), 0).rgb; }\n"
+                "vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }\n"
+                "void main() {\n"
+                "  int w = int(uP1.z), h = int(uP1.w);\n"
+                "  ivec2 c = ivec2(gl_FragCoord.xy);\n"
+                "  vec3 col = fetch(c, h);\n"
+                "  if (uP1.y > 0.0) {   // unsharp mask from the 4 neighbours\n"
+                "    vec3 b = 0.25 * (fetch(c + ivec2(1, 0), h) + fetch(c - ivec2(1, 0), h) + fetch(c + ivec2(0, 1), h) + fetch(c - ivec2(0, 1), h));\n"
+                "    col += (col - b) * (uP1.y * 1.5);\n"
+                "  }\n"
+                "  col = max(col * uP0.x, 0.0);\n"
+                "  if (uP0.y > 0.0) {   // ACES-style S-curve in linear light, white point renormalised so 1.0 stays 1.0\n"
+                "    vec3 lin = pow(col, vec3(2.2));\n"
+                "    lin = mix(lin, aces(lin) / 0.8038, uP0.y);\n"
+                "    col = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));\n"
+                "  }\n"
+                "  col = (col - 0.5) * uP0.z + 0.5;\n"
+                "  float l = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
+                "  col = mix(vec3(l), col, uP0.w);\n"
+                "  vec2 q = (gl_FragCoord.xy / vec2(float(w), float(h))) * 2.0 - 1.0;\n"
+                "  col *= 1.0 - uP1.x * dot(q, q) * 0.5;\n"
+                "  float d = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;   // 1-LSB dither against banding\n"
+                "  o = vec4(clamp(col + d / 255.0, 0.0, 1.0), 1.0);\n"
+                "}\n";
+            GLuint v = compile(GL_VERTEX_SHADER, vs, "grade vertex"), f = compile(GL_FRAGMENT_SHADER, fs, "grade fragment");
+            if (!v || !f) { gradeFailed = true; return false; }
+            gradeProg = glCreateProgram();
+            glAttachShader(gradeProg, v); glAttachShader(gradeProg, f);
+            glLinkProgram(gradeProg);
+            GLint ok = 0; glGetProgramiv(gradeProg, GL_LINK_STATUS, &ok);
+            glDeleteShader(v); glDeleteShader(f);
+            if (!ok) {
+                char log[2048]; GLsizei n = 0; glGetProgramInfoLog(gradeProg, sizeof log, &n, log);
+                Log("grade program link failed: %s", log); glDeleteProgram(gradeProg); gradeProg = 0; gradeFailed = true; return false;
+            }
+            glUseProgram(gradeProg);
+            glUniform1i(glGetUniformLocation(gradeProg, "uTex"), kScratchUnit);
+            gradeU0 = glGetUniformLocation(gradeProg, "uP0"); gradeU1 = glGetUniformLocation(gradeProg, "uP1");
+            glGenVertexArrays(1, &gradeVao); glGenFramebuffers(1, &gradeFbo);
+            Log("colour grade pass ready");
+        }
+        if (!gradeTex || gradeW != w || gradeH != h) {   // (re)create the copy target when the backbuffer size changes
+            if (gradeTex) glDeleteTextures(1, &gradeTex);
+            glGenTextures(1, &gradeTex);
+            glActiveTexture(GL_TEXTURE0 + kScratchUnit); g_activeUnit = kScratchUnit;
+            glBindTexture(GL_TEXTURE_2D, gradeTex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gradeFbo);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gradeTex, 0);
+            gradeW = w; gradeH = h;
+        }
+        // 1) copy backbuffer -> texture (same orientation; the shader flips)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gradeFbo);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        // 2) draw it to the canvas through the grade shader
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glViewport(0, 0, w, h);
+        glActiveTexture(GL_TEXTURE0 + kScratchUnit); g_activeUnit = kScratchUnit;
+        glBindTexture(GL_TEXTURE_2D, gradeTex);
+        glUseProgram(gradeProg);
+        glUniform4f(gradeU0, p[0], p[1], p[2], p[3]);
+        glUniform4f(gradeU1, p[4], p[5], (float)w, (float)h);
+        glBindVertexArray(gradeVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(vao);
+        // the normal draw path keeps its own copy of this state: force it to be re-applied
+        gl.program = ~0u; gl.depthTest = gl.cull = gl.blend = gl.stencil = gl.colorMask = -1; gl.vpx = gl.vpy = gl.vpw = gl.vph = -1;
+        return true;
+    }
+
     HRESULT presentFrame()
     {
         PROF_SCOPED("gl:present");
@@ -877,11 +974,14 @@ struct Device : RefImpl<IDirect3DDevice9> {
         backbuffer->ensureGL();
         Surface *cols[4] = {backbuffer, nullptr, nullptr, nullptr};
         GLuint rf = getFBO(cols, nullptr);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glDisable(GL_SCISSOR_TEST); gl.scissor = 0;
         GLint w = (GLint)backbuffer->w, h = (GLint)backbuffer->h;
-        glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (!applyGrade(rf, w, h)) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+            glDisable(GL_SCISSOR_TEST); gl.scissor = 0;
+            glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        glDisable(GL_SCISSOR_TEST); gl.scissor = 0;
         gpuSegEnd();
         if (webprof::g_on && profSync) { PROF_SCOPED("gl:finish(gpu wait)"); glFinish(); }
         // (frame is presented by the browser when this task ends; no emscripten_webgl_commit_frame: see init())
